@@ -19,13 +19,12 @@ use std::sync::Arc;
 
 use api::v1::meta::Peer;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-use common_greptimedb_telemetry::GreptimeDBTelemetryTask;
 use common_grpc::channel_manager;
 use common_meta::key::TableMetadataManagerRef;
 use common_procedure::options::ProcedureConfig;
 use common_procedure::ProcedureManagerRef;
 use common_telemetry::logging::LoggingOptions;
-use common_telemetry::{debug, error, info, warn};
+use common_telemetry::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use servers::http::HttpOptions;
 use snafu::ResultExt;
@@ -185,7 +184,6 @@ pub struct MetaSrv {
     mailbox: MailboxRef,
     ddl_manager: DdlManagerRef,
     table_metadata_manager: TableMetadataManagerRef,
-    greptimedb_telemetry_task: Arc<GreptimeDBTelemetryTask>,
     pubsub: Option<(PublishRef, SubscribeManagerRef)>,
 }
 
@@ -208,7 +206,6 @@ impl MetaSrv {
             let leader_cached_kv_store = self.leader_cached_kv_store.clone();
             let subscribe_manager = self.subscribe_manager().cloned();
             let mut rx = election.subscribe_leader_change();
-            let task_handler = self.greptimedb_telemetry_task.clone();
             let _handle = common_runtime::spawn_bg(async move {
                 loop {
                     match rx.recv().await {
@@ -224,10 +221,6 @@ impl MetaSrv {
                                     if let Err(e) = procedure_manager.recover().await {
                                         error!("Failed to recover procedures, error: {e}");
                                     }
-                                    let _ = task_handler.start(common_runtime::bg_runtime())
-                                    .map_err(|e| {
-                                        debug!("Failed to start greptimedb telemetry task, error: {e}");
-                                    });
                                 }
                                 LeaderChangeMessage::StepDown(leader) => {
                                     if let Some(sub_manager) = subscribe_manager.clone() {
@@ -237,11 +230,6 @@ impl MetaSrv {
                                         }
                                     }
                                     error!("Leader :{:?} step down", leader);
-                                    let _ = task_handler.stop().await.map_err(|e| {
-                                        debug!(
-                                            "Failed to stop greptimedb telemetry task, error: {e}"
-                                        );
-                                    });
                                 }
                             }
                         }

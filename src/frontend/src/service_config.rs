@@ -17,7 +17,6 @@ pub mod grpc;
 pub mod influxdb;
 pub mod mysql;
 pub mod opentsdb;
-pub mod otlp;
 pub mod postgres;
 pub mod prom_store;
 
@@ -25,7 +24,6 @@ pub use grpc::GrpcOptions;
 pub use influxdb::InfluxdbOptions;
 pub use mysql::MysqlOptions;
 pub use opentsdb::OpentsdbOptions;
-pub use otlp::OtlpOptions;
 pub use postgres::PostgresOptions;
 pub use prom_store::PromStoreOptions;
 

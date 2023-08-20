@@ -20,8 +20,8 @@ use servers::http::HttpOptions;
 use servers::Mode;
 
 use crate::service_config::{
-    DatanodeOptions, GrpcOptions, InfluxdbOptions, MysqlOptions, OpentsdbOptions, OtlpOptions,
-    PostgresOptions, PromStoreOptions,
+    DatanodeOptions, GrpcOptions, InfluxdbOptions, MysqlOptions, OpentsdbOptions,
+    PostgresOptions, PromStoreOptions, PrometheusOptions,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,7 +37,7 @@ pub struct FrontendOptions {
     pub opentsdb_options: Option<OpentsdbOptions>,
     pub influxdb_options: Option<InfluxdbOptions>,
     pub prom_store_options: Option<PromStoreOptions>,
-    pub otlp_options: Option<OtlpOptions>,
+    pub prometheus_options: Option<PrometheusOptions>,
     pub meta_client_options: Option<MetaClientOptions>,
     pub logging: LoggingOptions,
     pub datanode: DatanodeOptions,
@@ -56,7 +56,7 @@ impl Default for FrontendOptions {
             opentsdb_options: Some(OpentsdbOptions::default()),
             influxdb_options: Some(InfluxdbOptions::default()),
             prom_store_options: Some(PromStoreOptions::default()),
-            otlp_options: Some(OtlpOptions::default()),
+            prometheus_options: Some(PrometheusOptions::default()),
             meta_client_options: None,
             logging: LoggingOptions::default(),
             datanode: DatanodeOptions::default(),
