@@ -134,12 +134,6 @@ pub enum Error {
         source: common_grpc::error::Error,
     },
 
-    #[snafu(display("Failed to write OTLP metrics, source: {}", source))]
-    OtlpMetricsWrite {
-        location: Location,
-        source: common_grpc::error::Error,
-    },
-
     #[snafu(display("Failed to convert time precision, name: {}", name))]
     TimePrecision { name: String, location: Location },
 
@@ -163,12 +157,6 @@ pub enum Error {
 
     #[snafu(display("Failed to decode prometheus remote request, source: {}", source))]
     DecodePromRemoteRequest {
-        location: Location,
-        source: prost::DecodeError,
-    },
-
-    #[snafu(display("Failed to decode OTLP request, source: {}", source))]
-    DecodeOtlpRequest {
         location: Location,
         source: prost::DecodeError,
     },
@@ -364,7 +352,6 @@ impl ErrorExt for Error {
             | InvalidOpentsdbLine { .. }
             | InvalidOpentsdbJsonRequest { .. }
             | DecodePromRemoteRequest { .. }
-            | DecodeOtlpRequest { .. }
             | DecompressPromRemoteRequest { .. }
             | InvalidPromRemoteRequest { .. }
             | InvalidFlightTicket { .. }
@@ -374,8 +361,7 @@ impl ErrorExt for Error {
             | TimePrecision { .. } => StatusCode::InvalidArguments,
 
             InfluxdbLinesWrite { source, .. }
-            | PromSeriesWrite { source, .. }
-            | OtlpMetricsWrite { source, .. } => source.status_code(),
+            | PromSeriesWrite { source, .. } => source.status_code(),
 
             Hyper { .. } => StatusCode::Unknown,
             TlsRequired { .. } => StatusCode::Unknown,
@@ -502,7 +488,6 @@ impl IntoResponse for Error {
             | Error::InvalidOpentsdbLine { .. }
             | Error::InvalidOpentsdbJsonRequest { .. }
             | Error::DecodePromRemoteRequest { .. }
-            | Error::DecodeOtlpRequest { .. }
             | Error::DecompressPromRemoteRequest { .. }
             | Error::InvalidPromRemoteRequest { .. }
             | Error::InvalidQuery { .. }

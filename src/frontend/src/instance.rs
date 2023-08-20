@@ -16,7 +16,6 @@ pub mod distributed;
 mod grpc;
 mod influxdb;
 mod opentsdb;
-mod otlp;
 mod prom_store;
 mod standalone;
 
@@ -65,7 +64,7 @@ use servers::prometheus::PrometheusHandler;
 use servers::query_handler::grpc::{GrpcQueryHandler, GrpcQueryHandlerRef};
 use servers::query_handler::sql::SqlQueryHandler;
 use servers::query_handler::{
-    InfluxdbLineProtocolHandler, OpenTelemetryProtocolHandler, OpentsdbProtocolHandler,
+    InfluxdbLineProtocolHandler, OpentsdbProtocolHandler,
     PromStoreProtocolHandler,
 };
 use session::context::QueryContextRef;
@@ -98,7 +97,6 @@ pub trait FrontendInstance:
     + OpentsdbProtocolHandler
     + InfluxdbLineProtocolHandler
     + PromStoreProtocolHandler
-    + OpenTelemetryProtocolHandler
     + PrometheusHandler
     + Send
     + Sync

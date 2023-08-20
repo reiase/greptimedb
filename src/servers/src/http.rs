@@ -19,7 +19,6 @@ pub mod header;
 pub mod influxdb;
 pub mod mem_prof;
 pub mod opentsdb;
-pub mod otlp;
 mod pprof;
 pub mod prom_store;
 
@@ -80,7 +79,7 @@ use crate::prometheus::{
 use crate::query_handler::grpc::ServerGrpcQueryHandlerRef;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::query_handler::{
-    InfluxdbLineProtocolHandlerRef, OpenTelemetryProtocolHandlerRef, OpentsdbProtocolHandlerRef,
+    InfluxdbLineProtocolHandlerRef, OpentsdbProtocolHandlerRef,
     PromStoreProtocolHandlerRef,
 };
 use crate::server::Server;
@@ -132,7 +131,6 @@ pub struct HttpServer {
     opentsdb_handler: Option<OpentsdbProtocolHandlerRef>,
     prom_handler: Option<PromStoreProtocolHandlerRef>,
     prometheus_handler: Option<PrometheusHandlerRef>,
-    otlp_handler: Option<OpenTelemetryProtocolHandlerRef>,
     shutdown_tx: Mutex<Option<Sender<()>>>,
     user_provider: Option<UserProviderRef>,
     metrics_handler: Option<MetricsHandler>,
@@ -412,7 +410,6 @@ impl HttpServerBuilder {
                 influxdb_handler: None,
                 prom_handler: None,
                 prometheus_handler: None,
-                otlp_handler: None,
                 user_provider: None,
                 metrics_handler: None,
                 shutdown_tx: Mutex::new(None),
@@ -449,11 +446,6 @@ impl HttpServerBuilder {
 
     pub fn with_prometheus_handler(&mut self, handler: PrometheusHandlerRef) -> &mut Self {
         let _ = self.inner.prometheus_handler.get_or_insert(handler);
-        self
-    }
-
-    pub fn with_otlp_handler(&mut self, handler: OpenTelemetryProtocolHandlerRef) -> &mut Self {
-        let _ = self.inner.otlp_handler.get_or_insert(handler);
         self
     }
 
@@ -542,13 +534,6 @@ impl HttpServer {
             router = router.nest(
                 &format!("/{HTTP_API_VERSION}/prometheus"),
                 self.route_prometheus(prometheus_handler),
-            );
-        }
-
-        if let Some(otlp_handler) = self.otlp_handler.clone() {
-            router = router.nest(
-                &format!("/{HTTP_API_VERSION}/otlp"),
-                self.route_otlp(otlp_handler),
             );
         }
 
@@ -687,12 +672,6 @@ impl HttpServer {
         Router::new()
             .route("/api/put", routing::post(opentsdb::put))
             .with_state(opentsdb_handler)
-    }
-
-    fn route_otlp<S>(&self, otlp_handler: OpenTelemetryProtocolHandlerRef) -> Router<S> {
-        Router::new()
-            .route("/v1/metrics", routing::post(otlp::metrics))
-            .with_state(otlp_handler)
     }
 
     fn route_admin<S>(&self, grpc_handler: ServerGrpcQueryHandlerRef) -> Router<S> {

@@ -17,8 +17,6 @@ use std::env;
 use std::sync::{Arc, Mutex, Once};
 
 use once_cell::sync::Lazy;
-use opentelemetry::global;
-use opentelemetry::sdk::propagation::TraceContextPropagator;
 use serde::{Deserialize, Serialize};
 pub use tracing::{event, span, Level};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -127,7 +125,6 @@ pub fn init_global_logging(
     let mut guards = vec![];
     let dir = &opts.dir;
     let level = &opts.level;
-    let enable_jaeger_tracing = opts.enable_jaeger_tracing;
 
     // Enable log compatible layer to convert log record to tracing span.
     LogTracer::init().expect("log tracer must be valid");
@@ -208,21 +205,10 @@ pub fn init_global_logging(
         .with(file_logging_layer)
         .with(err_file_logging_layer.with_filter(filter::LevelFilter::ERROR));
 
-    if enable_jaeger_tracing {
-        // Jaeger layer.
-        global::set_text_map_propagator(TraceContextPropagator::new());
-        let tracer = opentelemetry_jaeger::new_pipeline()
-            .with_service_name(app_name)
-            .install_batch(opentelemetry::runtime::Tokio)
-            .expect("install");
-        let jaeger_layer = Some(tracing_opentelemetry::layer().with_tracer(tracer));
-        let subscriber = subscriber.with(jaeger_layer);
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("error setting global tracing subscriber");
-    } else {
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("error setting global tracing subscriber");
-    }
+
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("error setting global tracing subscriber");
+    
 
     guards
 }

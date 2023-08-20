@@ -41,7 +41,5 @@ pub use crate::error::Result;
 
 mod inactive_node_manager;
 
-mod greptimedb_telemetry;
-
 #[cfg(test)]
 mod test_util;

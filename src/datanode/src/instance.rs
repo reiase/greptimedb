@@ -25,7 +25,6 @@ use common_base::paths::{CLUSTER_DIR, WAL_DIR};
 use common_base::Plugins;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MIN_USER_TABLE_ID};
 use common_error::ext::BoxedError;
-use common_greptimedb_telemetry::GreptimeDBTelemetryTask;
 use common_grpc::channel_manager::{ChannelConfig, ChannelManager};
 use common_meta::heartbeat::handler::parse_mailbox_message::ParseMailboxMessageHandler;
 use common_meta::heartbeat::handler::HandlerGroupExecutor;
@@ -33,7 +32,7 @@ use common_meta::key::TableMetadataManager;
 use common_procedure::local::{LocalManager, ManagerConfig};
 use common_procedure::store::state_store::ObjectStateStore;
 use common_procedure::ProcedureManagerRef;
-use common_telemetry::logging::{debug, info};
+use common_telemetry::logging::info;
 use file_table_engine::engine::immutable::ImmutableFileTableEngine;
 use log_store::raft_engine::log_store::RaftEngineLogStore;
 use log_store::LogConfig;
@@ -63,7 +62,6 @@ use crate::error::{
     MissingNodeIdSnafu, NewCatalogSnafu, OpenLogStoreSnafu, RecoverProcedureSnafu, Result,
     ShutdownInstanceSnafu, StartProcedureManagerSnafu, StopProcedureManagerSnafu,
 };
-use crate::greptimedb_telemetry::get_greptimedb_telemetry_task;
 use crate::heartbeat::handler::close_region::CloseRegionHandler;
 use crate::heartbeat::handler::open_region::OpenRegionHandler;
 use crate::heartbeat::HeartbeatTask;
@@ -82,7 +80,6 @@ pub struct Instance {
     pub(crate) catalog_manager: CatalogManagerRef,
     pub(crate) table_id_provider: Option<TableIdProviderRef>,
     procedure_manager: ProcedureManagerRef,
-    greptimedb_telemetry_task: Arc<GreptimeDBTelemetryTask>,
 }
 
 pub type InstanceRef = Arc<Instance>;
@@ -306,12 +303,6 @@ impl Instance {
             catalog_manager: catalog_manager.clone(),
             table_id_provider,
             procedure_manager,
-            greptimedb_telemetry_task: get_greptimedb_telemetry_task(
-                Some(opts.storage.data_home.clone()),
-                &opts.mode,
-                opts.enable_telemetry,
-            )
-            .await,
         });
 
         let heartbeat_task = Instance::build_heartbeat_task(
@@ -340,12 +331,6 @@ impl Instance {
         self.procedure_manager
             .start()
             .context(StartProcedureManagerSnafu)?;
-        let _ = self
-            .greptimedb_telemetry_task
-            .start(common_runtime::bg_runtime())
-            .map_err(|e| {
-                debug!("Failed to start greptimedb telemetry task: {}", e);
-            });
 
         Ok(())
     }

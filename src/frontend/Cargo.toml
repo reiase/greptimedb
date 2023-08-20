@@ -48,7 +48,6 @@ mito = { workspace = true }
 moka = { version = "0.9", features = ["future"] }
 object-store = { workspace = true }
 openmetrics-parser = "0.4"
-opentelemetry-proto.workspace = true
 partition = { workspace = true }
 prost.workspace = true
 query = { workspace = true }

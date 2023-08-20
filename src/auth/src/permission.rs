@@ -29,7 +29,6 @@ pub enum PermissionReq<'a> {
     LineProtocol,
     PromStoreWrite,
     PromStoreRead,
-    Otlp,
 }
 
 #[derive(Debug)]
