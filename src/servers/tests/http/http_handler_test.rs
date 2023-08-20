@@ -22,7 +22,7 @@ use http_body::combinators::UnsyncBoxBody;
 use hyper::Response;
 use metrics::counter;
 use servers::http::{
-    handler as http_handler, script as script_handler, ApiState, GreptimeOptionsConfigState,
+    handler as http_handler, ApiState, GreptimeOptionsConfigState,
     JsonOutput,
 };
 use servers::metrics_handler::MetricsHandler;
@@ -30,7 +30,7 @@ use session::context::QueryContext;
 use table::test_util::MemTable;
 
 use crate::{
-    create_testing_script_handler, create_testing_sql_query_handler, ScriptHandlerRef,
+    create_testing_sql_query_handler,
     ServerSqlQueryHandlerRef,
 };
 
@@ -42,7 +42,6 @@ async fn test_sql_not_provided() {
     let Json(json) = http_handler::sql(
         State(ApiState {
             sql_handler,
-            script_handler: None,
         }),
         Query(http_handler::SqlQuery::default()),
         axum::Extension(ctx),
@@ -69,7 +68,6 @@ async fn test_sql_output_rows() {
     let Json(json) = http_handler::sql(
         State(ApiState {
             sql_handler,
-            script_handler: None,
         }),
         query,
         axum::Extension(ctx),
@@ -118,7 +116,6 @@ async fn test_sql_form() {
     let Json(json) = http_handler::sql(
         State(ApiState {
             sql_handler,
-            script_handler: None,
         }),
         Query(http_handler::SqlQuery::default()),
         axum::Extension(ctx),
@@ -162,191 +159,6 @@ async fn test_metrics() {
     let stats = MetricsHandler;
     let text = http_handler::metrics(axum::extract::State(stats), Query(HashMap::default())).await;
     assert!(text.contains("test_metrics counter"));
-}
-
-async fn insert_script(
-    script: String,
-    script_handler: ScriptHandlerRef,
-    sql_handler: ServerSqlQueryHandlerRef,
-) {
-    let body = RawBody(Body::from(script.clone()));
-    let invalid_query = create_invalid_script_query();
-    let Json(json) = script_handler::scripts(
-        State(ApiState {
-            sql_handler: sql_handler.clone(),
-            script_handler: Some(script_handler.clone()),
-        }),
-        invalid_query,
-        body,
-    )
-    .await;
-    assert!(!json.success(), "{json:?}");
-    assert_eq!(json.error().unwrap(), "Invalid argument: invalid schema");
-
-    let body = RawBody(Body::from(script.clone()));
-    let exec = create_script_query();
-    // Insert the script
-    let Json(json) = script_handler::scripts(
-        State(ApiState {
-            sql_handler: sql_handler.clone(),
-            script_handler: Some(script_handler.clone()),
-        }),
-        exec,
-        body,
-    )
-    .await;
-    assert!(json.success(), "{json:?}");
-    assert!(json.error().is_none());
-    assert!(json.output().is_none());
-}
-
-#[tokio::test]
-async fn test_scripts() {
-    common_telemetry::init_default_ut_logging();
-
-    let script = r#"
-@copr(sql='select uint32s as number from numbers limit 5', args=['number'], returns=['n'])
-def test(n) -> vector[i64]:
-    return n;
-"#
-    .to_string();
-    let sql_handler = create_testing_sql_query_handler(MemTable::default_numbers_table());
-    let script_handler = create_testing_script_handler(MemTable::default_numbers_table());
-
-    insert_script(script.clone(), script_handler.clone(), sql_handler.clone()).await;
-    // Run the script
-    let exec = create_script_query();
-    let Json(json) = script_handler::run_script(
-        State(ApiState {
-            sql_handler,
-            script_handler: Some(script_handler),
-        }),
-        exec,
-    )
-    .await;
-    assert!(json.success(), "{json:?}");
-    assert!(json.error().is_none());
-
-    match &json.output().unwrap()[0] {
-        JsonOutput::Records(records) => {
-            let json = serde_json::to_string_pretty(&records).unwrap();
-            assert_eq!(5, records.num_rows());
-            assert_eq!(
-                json,
-                r#"{
-  "schema": {
-    "column_schemas": [
-      {
-        "name": "n",
-        "data_type": "Int64"
-      }
-    ]
-  },
-  "rows": [
-    [
-      0
-    ],
-    [
-      1
-    ],
-    [
-      2
-    ],
-    [
-      3
-    ],
-    [
-      4
-    ]
-  ]
-}"#
-            );
-        }
-        _ => unreachable!(),
-    }
-}
-
-#[tokio::test]
-async fn test_scripts_with_params() {
-    common_telemetry::init_default_ut_logging();
-
-    let script = r#"
-@copr(sql='select uint32s as number from numbers limit 5', args=['number'], returns=['n'])
-def test(n, **params)  -> vector[i64]:
-    return n + int(params['a'])
-"#
-    .to_string();
-    let sql_handler = create_testing_sql_query_handler(MemTable::default_numbers_table());
-    let script_handler = create_testing_script_handler(MemTable::default_numbers_table());
-
-    insert_script(script.clone(), script_handler.clone(), sql_handler.clone()).await;
-    // Run the script
-    let mut exec = create_script_query();
-    let _ = exec.0.params.insert("a".to_string(), "42".to_string());
-    let Json(json) = script_handler::run_script(
-        State(ApiState {
-            sql_handler,
-            script_handler: Some(script_handler),
-        }),
-        exec,
-    )
-    .await;
-    assert!(json.success(), "{json:?}");
-    assert!(json.error().is_none());
-
-    match &json.output().unwrap()[0] {
-        JsonOutput::Records(records) => {
-            let json = serde_json::to_string_pretty(&records).unwrap();
-            assert_eq!(5, records.num_rows());
-            assert_eq!(
-                json,
-                r#"{
-  "schema": {
-    "column_schemas": [
-      {
-        "name": "n",
-        "data_type": "Int64"
-      }
-    ]
-  },
-  "rows": [
-    [
-      42
-    ],
-    [
-      43
-    ],
-    [
-      44
-    ],
-    [
-      45
-    ],
-    [
-      46
-    ]
-  ]
-}"#
-            );
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn create_script_query() -> Query<script_handler::ScriptQuery> {
-    Query(script_handler::ScriptQuery {
-        db: Some("test".to_string()),
-        name: Some("test".to_string()),
-        ..Default::default()
-    })
-}
-
-fn create_invalid_script_query() -> Query<script_handler::ScriptQuery> {
-    Query(script_handler::ScriptQuery {
-        db: None,
-        name: None,
-        ..Default::default()
-    })
 }
 
 fn create_query() -> Query<http_handler::SqlQuery> {

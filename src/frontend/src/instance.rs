@@ -18,7 +18,6 @@ mod influxdb;
 mod opentsdb;
 mod otlp;
 mod prom_store;
-mod script;
 mod standalone;
 
 use std::collections::HashMap;
@@ -69,7 +68,7 @@ use servers::query_handler::grpc::{GrpcQueryHandler, GrpcQueryHandlerRef};
 use servers::query_handler::sql::SqlQueryHandler;
 use servers::query_handler::{
     InfluxdbLineProtocolHandler, OpenTelemetryProtocolHandler, OpentsdbProtocolHandler,
-    PromStoreProtocolHandler, ScriptHandler,
+    PromStoreProtocolHandler,
 };
 use session::context::QueryContextRef;
 use snafu::prelude::*;
@@ -93,7 +92,6 @@ use crate::heartbeat::HeartbeatTask;
 use crate::instance::standalone::StandaloneGrpcQueryHandler;
 use crate::metrics;
 use crate::row_inserter::RowInserter;
-use crate::script::ScriptExecutor;
 use crate::server::{start_server, ServerHandlers, Services};
 use crate::statement::StatementExecutor;
 
@@ -105,7 +103,6 @@ pub trait FrontendInstance:
     + InfluxdbLineProtocolHandler
     + PromStoreProtocolHandler
     + OpenTelemetryProtocolHandler
-    + ScriptHandler
     + PrometheusHandler
     + Send
     + Sync
@@ -120,7 +117,6 @@ pub type StatementExecutorRef = Arc<StatementExecutor>;
 #[derive(Clone)]
 pub struct Instance {
     catalog_manager: CatalogManagerRef,
-    script_executor: Arc<ScriptExecutor>,
     statement_executor: Arc<StatementExecutor>,
     query_engine: QueryEngineRef,
     grpc_query_handler: GrpcQueryHandlerRef<Error>,
@@ -183,9 +179,6 @@ impl Instance {
         )
         .query_engine();
 
-        let script_executor =
-            Arc::new(ScriptExecutor::new(catalog_manager.clone(), query_engine.clone()).await?);
-
         let statement_executor = Arc::new(StatementExecutor::new(
             catalog_manager.clone(),
             query_engine.clone(),
@@ -221,7 +214,6 @@ impl Instance {
 
         Ok(Instance {
             catalog_manager,
-            script_executor,
             create_expr_factory,
             statement_executor,
             query_engine,
@@ -273,8 +265,6 @@ impl Instance {
     pub async fn try_new_standalone(dn_instance: DnInstanceRef) -> Result<Self> {
         let catalog_manager = dn_instance.catalog_manager();
         let query_engine = dn_instance.query_engine();
-        let script_executor =
-            Arc::new(ScriptExecutor::new(catalog_manager.clone(), query_engine.clone()).await?);
 
         let statement_executor = Arc::new(StatementExecutor::new(
             catalog_manager.clone(),
@@ -294,7 +284,6 @@ impl Instance {
 
         Ok(Instance {
             catalog_manager: catalog_manager.clone(),
-            script_executor,
             create_expr_factory,
             statement_executor,
             query_engine,

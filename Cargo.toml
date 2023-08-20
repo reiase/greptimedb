@@ -40,7 +40,6 @@ members = [
     "src/partition",
     "src/promql",
     "src/query",
-    "src/script",
     "src/servers",
     "src/session",
     "src/sql",
@@ -142,7 +141,6 @@ object-store = { path = "src/object-store" }
 partition = { path = "src/partition" }
 promql = { path = "src/promql" }
 query = { path = "src/query" }
-script = { path = "src/script" }
 servers = { path = "src/servers" }
 session = { path = "src/session" }
 sql = { path = "src/sql" }

@@ -25,12 +25,10 @@
 pub mod grpc;
 pub mod sql;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::prom_store::remote::{ReadRequest, WriteRequest};
 use async_trait::async_trait;
-use common_query::Output;
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
@@ -45,18 +43,6 @@ pub type OpentsdbProtocolHandlerRef = Arc<dyn OpentsdbProtocolHandler + Send + S
 pub type InfluxdbLineProtocolHandlerRef = Arc<dyn InfluxdbLineProtocolHandler + Send + Sync>;
 pub type PromStoreProtocolHandlerRef = Arc<dyn PromStoreProtocolHandler + Send + Sync>;
 pub type OpenTelemetryProtocolHandlerRef = Arc<dyn OpenTelemetryProtocolHandler + Send + Sync>;
-pub type ScriptHandlerRef = Arc<dyn ScriptHandler + Send + Sync>;
-
-#[async_trait]
-pub trait ScriptHandler {
-    async fn insert_script(&self, schema: &str, name: &str, script: &str) -> Result<()>;
-    async fn execute_script(
-        &self,
-        schema: &str,
-        name: &str,
-        params: HashMap<String, String>,
-    ) -> Result<Output>;
-}
 
 #[async_trait]
 pub trait InfluxdbLineProtocolHandler {
