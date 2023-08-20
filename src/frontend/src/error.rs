@@ -422,12 +422,6 @@ pub enum Error {
         source: table::error::Error,
     },
 
-    #[snafu(display("Failed to start script manager, source: {}", source))]
-    StartScriptManager {
-        #[snafu(backtrace)]
-        source: script::error::Error,
-    },
-
     #[snafu(display("Failed to build regex, source: {}", source))]
     BuildRegex {
         location: Location,
@@ -712,8 +706,6 @@ impl ErrorExt for Error {
             | Error::SplitDelete { source, .. } => source.status_code(),
 
             Error::UnrecognizedTableOption { .. } => StatusCode::InvalidArguments,
-
-            Error::StartScriptManager { source } => source.status_code(),
 
             Error::TableScanExec { source, .. } => source.status_code(),
 

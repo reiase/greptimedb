@@ -15,8 +15,6 @@
 pub(crate) const METRIC_HANDLE_SQL_ELAPSED: &str = "frontend.handle_sql_elapsed";
 pub(crate) const METRIC_HANDLE_PROMQL_ELAPSED: &str = "frontend.handle_promql_elapsed";
 pub(crate) const METRIC_EXEC_PLAN_ELAPSED: &str = "frontend.exec_plan_elapsed";
-pub(crate) const METRIC_HANDLE_SCRIPTS_ELAPSED: &str = "frontend.handle_scripts_elapsed";
-pub(crate) const METRIC_RUN_SCRIPT_ELAPSED: &str = "frontend.run_script_elapsed";
 
 /// frontend metrics
 /// Metrics for creating table in dist mode.

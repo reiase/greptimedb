@@ -22,7 +22,6 @@ pub mod opentsdb;
 pub mod otlp;
 mod pprof;
 pub mod prom_store;
-pub mod script;
 
 #[cfg(feature = "dashboard")]
 mod dashboard;
@@ -82,7 +81,7 @@ use crate::query_handler::grpc::ServerGrpcQueryHandlerRef;
 use crate::query_handler::sql::ServerSqlQueryHandlerRef;
 use crate::query_handler::{
     InfluxdbLineProtocolHandlerRef, OpenTelemetryProtocolHandlerRef, OpentsdbProtocolHandlerRef,
-    PromStoreProtocolHandlerRef, ScriptHandlerRef,
+    PromStoreProtocolHandlerRef,
 };
 use crate::server::Server;
 
@@ -134,7 +133,6 @@ pub struct HttpServer {
     prom_handler: Option<PromStoreProtocolHandlerRef>,
     prometheus_handler: Option<PrometheusHandlerRef>,
     otlp_handler: Option<OpenTelemetryProtocolHandlerRef>,
-    script_handler: Option<ScriptHandlerRef>,
     shutdown_tx: Mutex<Option<Sender<()>>>,
     user_provider: Option<UserProviderRef>,
     metrics_handler: Option<MetricsHandler>,
@@ -391,7 +389,6 @@ async fn serve_docs() -> Html<String> {
 #[derive(Clone)]
 pub struct ApiState {
     pub sql_handler: ServerSqlQueryHandlerRef,
-    pub script_handler: Option<ScriptHandlerRef>,
 }
 
 #[derive(Clone)]
@@ -417,7 +414,6 @@ impl HttpServerBuilder {
                 prometheus_handler: None,
                 otlp_handler: None,
                 user_provider: None,
-                script_handler: None,
                 metrics_handler: None,
                 shutdown_tx: Mutex::new(None),
                 configurator: None,
@@ -438,11 +434,6 @@ impl HttpServerBuilder {
 
     pub fn with_opentsdb_handler(&mut self, handler: OpentsdbProtocolHandlerRef) -> &mut Self {
         let _ = self.inner.opentsdb_handler.get_or_insert(handler);
-        self
-    }
-
-    pub fn with_script_handler(&mut self, handler: ScriptHandlerRef) -> &mut Self {
-        let _ = self.inner.script_handler.get_or_insert(handler);
         self
     }
 
@@ -513,7 +504,6 @@ impl HttpServer {
             let sql_router = self
                 .route_sql(ApiState {
                     sql_handler,
-                    script_handler: self.script_handler.clone(),
                 })
                 .finish_api(&mut api)
                 .layer(Extension(api.clone()));
@@ -659,8 +649,6 @@ impl HttpServer {
                 apirouting::get_with(handler::promql, handler::sql_docs)
                     .post_with(handler::promql, handler::sql_docs),
             )
-            .api_route("/scripts", apirouting::post(script::scripts))
-            .api_route("/run-script", apirouting::post(script::run_script))
             .route("/private/api.json", apirouting::get(serve_api))
             .route("/private/docs", apirouting::get(serve_docs))
             .with_state(api_state)

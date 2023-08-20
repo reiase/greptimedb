@@ -448,7 +448,6 @@ pub async fn setup_test_http_app_with_frontend_and_user_provider(
     http_server
         .with_sql_handler(ServerSqlQueryHandlerAdaptor::arc(frontend_ref.clone()))
         .with_grpc_handler(ServerGrpcQueryHandlerAdaptor::arc(frontend_ref.clone()))
-        .with_script_handler(frontend_ref)
         .with_greptime_config_options(opts.to_toml_string());
 
     if let Some(user_provider) = user_provider {
@@ -541,7 +540,6 @@ pub async fn setup_test_prom_app_with_frontend(
     let http_server = HttpServerBuilder::new(http_opts)
         .with_sql_handler(ServerSqlQueryHandlerAdaptor::arc(frontend_ref.clone()))
         .with_grpc_handler(ServerGrpcQueryHandlerAdaptor::arc(frontend_ref.clone()))
-        .with_script_handler(frontend_ref.clone())
         .with_prom_handler(frontend_ref.clone())
         .with_prometheus_handler(frontend_ref)
         .with_greptime_config_options(opts.to_toml_string())
