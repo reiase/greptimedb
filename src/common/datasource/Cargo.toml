@@ -8,7 +8,6 @@ license.workspace = true
 arrow-schema.workspace = true
 arrow.workspace = true
 async-compression = { version = "0.3", features = [
-    "bzip2",
     "gzip",
     "xz",
     "zstd",
