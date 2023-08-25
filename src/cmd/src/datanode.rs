@@ -84,7 +84,7 @@ struct StartCommand {
     rpc_addr: Option<String>,
     #[clap(long)]
     rpc_hostname: Option<String>,
-    #[clap(long, multiple = true, value_delimiter = ',')]
+    #[clap(long, num_args = 0.., value_delimiter = ',')]
     metasrv_addr: Option<Vec<String>>,
     #[clap(short, long)]
     config_file: Option<String>,

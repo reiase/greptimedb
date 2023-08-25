@@ -3,11 +3,11 @@ name = "cmd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-default-run = "greptime"
+default-run = "engram"
 
 [[bin]]
-name = "greptime"
-path = "src/bin/greptime.rs"
+name = "engram"
+path = "src/bin/engram.rs"
 
 [features]
 default = ["metrics-process"]
