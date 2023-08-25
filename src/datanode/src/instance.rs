@@ -299,12 +299,6 @@ impl Instance {
             &*procedure_manager,
         );
         let row_inserter = RowInserter::new(catalog_manager.clone());
-        let greptimedb_telemetry_task = get_greptimedb_telemetry_task(
-            Some(opts.storage.data_home.clone()),
-            &opts.mode,
-            opts.enable_telemetry,
-        )
-        .await;
 
         let instance = Arc::new(Self {
             query_engine: query_engine.clone(),
