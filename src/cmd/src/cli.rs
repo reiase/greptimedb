@@ -16,16 +16,12 @@ mod bench;
 mod cmd;
 mod helper;
 mod repl;
-// TODO(weny): Removes it
-#[allow(deprecated)]
-mod upgrade;
 
 use async_trait::async_trait;
 use bench::BenchTableMetadataCommand;
 use clap::Parser;
 use common_telemetry::logging::LoggingOptions;
 pub use repl::Repl;
-use upgrade::UpgradeCommand;
 
 use crate::error::Result;
 use crate::options::{Options, TopLevelOptions};
@@ -79,7 +75,6 @@ impl Command {
 #[derive(Parser)]
 enum SubCommand {
     Attach(AttachCommand),
-    Upgrade(UpgradeCommand),
     Bench(BenchTableMetadataCommand),
 }
 
@@ -87,7 +82,6 @@ impl SubCommand {
     async fn build(self) -> Result<Instance> {
         match self {
             SubCommand::Attach(cmd) => cmd.build().await,
-            SubCommand::Upgrade(cmd) => cmd.build().await,
             SubCommand::Bench(cmd) => cmd.build().await,
         }
     }

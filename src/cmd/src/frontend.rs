@@ -108,7 +108,7 @@ pub struct StartCommand {
     config_file: Option<String>,
     #[clap(short, long)]
     influxdb_enable: Option<bool>,
-    #[clap(long, multiple = true, value_delimiter = ',')]
+    #[clap(long, num_args = 0.., value_delimiter = ',')]
     metasrv_addr: Option<Vec<String>>,
     #[clap(long)]
     tls_mode: Option<TlsMode>,

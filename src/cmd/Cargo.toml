@@ -3,11 +3,11 @@ name = "cmd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-default-run = "greptime"
+default-run = "engram"
 
 [[bin]]
-name = "greptime"
-path = "src/bin/greptime.rs"
+name = "engram"
+path = "src/bin/engram.rs"
 
 [features]
 default = ["metrics-process"]
@@ -20,7 +20,7 @@ async-trait.workspace = true
 auth.workspace = true
 catalog = { workspace = true }
 chrono.workspace = true
-clap = { version = "3.1", features = ["derive"] }
+clap = { version = "4.3.23", features = ["derive"] }
 client = { workspace = true }
 common-base = { workspace = true }
 common-error = { workspace = true }

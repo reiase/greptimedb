@@ -16,7 +16,7 @@ use std::fmt::Display;
 use std::io;
 use std::str::FromStr;
 
-use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, XzDecoder, ZstdDecoder};
+use async_compression::tokio::bufread::{GzipDecoder, XzDecoder, ZstdDecoder};
 use async_compression::tokio::write;
 use bytes::Bytes;
 use futures::Stream;
@@ -29,8 +29,6 @@ use crate::error::{self, Error, Result};
 pub enum CompressionType {
     /// Gzip-ed file
     Gzip,
-    /// Bzip2-ed file
-    Bzip2,
     /// Xz-ed file (liblzma)
     Xz,
     /// Zstd-ed file,
@@ -46,7 +44,6 @@ impl FromStr for CompressionType {
         let s = s.to_uppercase();
         match s.as_str() {
             "GZIP" | "GZ" => Ok(Self::Gzip),
-            "BZIP2" | "BZ2" => Ok(Self::Bzip2),
             "XZ" => Ok(Self::Xz),
             "ZST" | "ZSTD" => Ok(Self::Zstd),
             "" => Ok(Self::Uncompressed),
@@ -62,7 +59,6 @@ impl Display for CompressionType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Gzip => "GZIP",
-            Self::Bzip2 => "BZIP2",
             Self::Xz => "XZ",
             Self::Zstd => "ZSTD",
             Self::Uncompressed => "",
@@ -78,7 +74,6 @@ impl CompressionType {
     pub const fn file_extension(&self) -> &'static str {
         match self {
             Self::Gzip => "gz",
-            Self::Bzip2 => "bz2",
             Self::Xz => "xz",
             Self::Zstd => "zst",
             Self::Uncompressed => "",
@@ -178,4 +173,4 @@ macro_rules! impl_compression_type {
     };
 }
 
-impl_compression_type!((Gzip, Gzip), (Bzip2, Bz), (Xz, Xz), (Zstd, Zstd));
+impl_compression_type!((Gzip, Gzip), (Xz, Xz), (Zstd, Zstd));
