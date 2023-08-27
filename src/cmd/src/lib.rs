@@ -21,3 +21,4 @@ pub mod frontend;
 pub mod metasrv;
 pub mod options;
 pub mod standalone;
+pub mod cmd;

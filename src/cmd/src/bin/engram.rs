@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
+use cmd::cmd::standalone;
 use cmd::error::Error;
 use cmd::options::{Options, TopLevelOptions};
-use cmd::standalone;
+// use cmd::standalone;
 use common_telemetry::logging::{LoggingOptions, TracingOptions};
 use futures::executor::block_on;
 
@@ -15,7 +16,7 @@ struct Engram {
 
 #[derive(Subcommand)]
 enum Commands {
-    Standalone(standalone::Command),
+    Standalone(standalone::Standalone),
     REPL,
 }
 
@@ -43,7 +44,11 @@ async fn main() -> Result<(), Error> {
     let cli: Engram = Engram::parse();
     common_telemetry::set_panic_hook();
     common_telemetry::init_default_metrics_recorder();
-    let _guard = common_telemetry::init_global_logging("Engram", &LoggingOptions::default(), TracingOptions::default());
+    let _guard = common_telemetry::init_global_logging(
+        "Engram",
+        &LoggingOptions::default(),
+        TracingOptions::default(),
+    );
 
     let opts = cli.command.load_options()?;
     return cli.command.execute(opts);
