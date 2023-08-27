@@ -43,13 +43,11 @@ const LOCALHOST_WITH_0: &str = "127.0.0.1:0";
 
 pub struct DummyInstance {
     query_engine: QueryEngineRef,
-    py_engine: Arc<PyEngine>,
 }
 
 impl DummyInstance {
     fn new(query_engine: QueryEngineRef) -> Self {
         Self {
-            py_engine: Arc::new(PyEngine::new(query_engine.clone())),
             query_engine,
         }
     }
