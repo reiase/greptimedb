@@ -34,7 +34,6 @@ config = "0.13"
 datanode = { workspace = true }
 datatypes = { workspace = true }
 either = "1.8"
-etcd-client.workspace = true
 frontend = { workspace = true }
 futures.workspace = true
 meta-client = { workspace = true }
