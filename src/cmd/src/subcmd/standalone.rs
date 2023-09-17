@@ -17,10 +17,7 @@ use servers::tls::{TlsMode, TlsOption};
 use servers::Mode;
 use snafu::ResultExt;
 
-use crate::error::{
-    IllegalConfigSnafu, Result, ShutdownDatanodeSnafu, ShutdownFrontendSnafu, StartDatanodeSnafu,
-    StartFrontendSnafu,
-};
+use crate::error::{IllegalConfigSnafu, Result, StartDatanodeSnafu, StartFrontendSnafu};
 use crate::frontend::load_frontend_plugins;
 use crate::options::{MixOptions, Options, TopLevelOptions};
 
@@ -33,40 +30,6 @@ async fn build_frontend(
         .context(StartFrontendSnafu)?;
     frontend_instance.set_plugins(plugins.clone());
     Ok(frontend_instance)
-}
-
-pub struct Instance {
-    datanode: Datanode,
-    frontend: FeInstance,
-}
-
-impl Instance {
-    pub async fn start(&mut self) -> Result<()> {
-        // Start datanode instance before starting services, to avoid requests come in before internal components are started.
-        self.datanode
-            .start_instance()
-            .await
-            .context(StartDatanodeSnafu)?;
-        info!("Datanode instance started");
-
-        self.frontend.start().await.context(StartFrontendSnafu)?;
-        Ok(())
-    }
-
-    pub async fn stop(&self) -> Result<()> {
-        self.frontend
-            .shutdown()
-            .await
-            .context(ShutdownFrontendSnafu)?;
-
-        self.datanode
-            .shutdown_instance()
-            .await
-            .context(ShutdownDatanodeSnafu)?;
-        info!("Datanode instance stopped.");
-
-        Ok(())
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -246,11 +209,7 @@ impl Standalone {
         })))
     }
 
-    pub async fn build(
-        self,
-        fe_opts: FrontendOptions,
-        dn_opts: DatanodeOptions,
-    ) -> Result<Instance> {
+    pub async fn execute(self, fe_opts: FrontendOptions, dn_opts: DatanodeOptions) -> Result<()> {
         let plugins = Arc::new(load_frontend_plugins(&self.user_provider)?);
 
         info!("Standalone start command: {:#?}", self);
@@ -259,9 +218,14 @@ impl Standalone {
             fe_opts, dn_opts
         );
 
-        let datanode = Datanode::new(dn_opts.clone(), Default::default())
+        let mut datanode = Datanode::new(dn_opts.clone(), Default::default())
             .await
             .context(StartDatanodeSnafu)?;
+        datanode
+            .start_instance()
+            .await
+            .context(StartDatanodeSnafu)?;
+        info!("Datanode instance started");
 
         let mut frontend = build_frontend(plugins.clone(), datanode.get_instance()).await?;
 
@@ -269,7 +233,8 @@ impl Standalone {
             .build_servers(&fe_opts)
             .await
             .context(StartFrontendSnafu)?;
+        frontend.start().await.context(StartFrontendSnafu)?;
 
-        Ok(Instance { datanode, frontend })
+        Ok(())
     }
 }

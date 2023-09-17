@@ -152,6 +152,8 @@ rev = "abbd357c1e193cd270ea65ee7652334a150b628f"
 
 [profile.release]
 debug = true
+strip = true
+lto = "thin"
 
 [profile.nightly]
 inherits = "release"

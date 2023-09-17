@@ -1,8 +1,7 @@
 use clap::{Parser, Subcommand};
-use cmd::cmd::standalone;
 use cmd::error::Error;
 use cmd::options::{Options, TopLevelOptions};
-// use cmd::standalone;
+use cmd::subcmd::{repl, standalone};
 use common_telemetry::logging::{LoggingOptions, TracingOptions};
 use futures::executor::block_on;
 
@@ -17,24 +16,23 @@ struct Engram {
 #[derive(Subcommand)]
 enum Commands {
     Standalone(standalone::Standalone),
-    REPL,
+    REPL(repl::REPL),
 }
 
 impl Commands {
     pub fn execute(self, opts: Options) -> Result<(), Error> {
         match (self, opts) {
             (Commands::Standalone(cmd), Options::Standalone(opts)) => {
-                let instance = block_on(cmd.build(opts.fe_opts, opts.dn_opts));
-                block_on(instance.unwrap().start())
+                block_on(cmd.execute(opts.fe_opts, opts.dn_opts))
             }
-            (Commands::REPL, Options::Cli(_)) => todo!(),
+            (Commands::REPL(cmd), Options::Cli(_)) => block_on(cmd.execute()),
             _ => unreachable!(),
         }
     }
     pub fn load_options(&self) -> Result<Options, Error> {
         match self {
             Commands::Standalone(cmd) => cmd.load_options(TopLevelOptions::default()),
-            Commands::REPL => todo!(),
+            Commands::REPL(cmd) => cmd.load_options(TopLevelOptions::default()),
         }
     }
 }

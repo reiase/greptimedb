@@ -160,13 +160,6 @@ pub enum Error {
         location: Location,
         source: catalog::error::Error,
     },
-
-    #[snafu(display("Failed to connect to Etcd at {etcd_addr}, source: {}", source))]
-    ConnectEtcd {
-        etcd_addr: String,
-        source: etcd_client::Error,
-        location: Location,
-    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -187,8 +180,7 @@ impl ErrorExt for Error {
             | Error::LoadLayeredConfig { .. }
             | Error::IllegalConfig { .. }
             | Error::InvalidReplCommand { .. }
-            | Error::IllegalAuthConfig { .. }
-            | Error::ConnectEtcd { .. } => StatusCode::InvalidArguments,
+            | Error::IllegalAuthConfig { .. } => StatusCode::InvalidArguments,
 
             Error::ReplCreation { .. } | Error::Readline { .. } => StatusCode::Internal,
             Error::RequestDatabase { source, .. } => source.status_code(),
