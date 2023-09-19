@@ -15,38 +15,35 @@
 use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
+use store_api::storage::{RegionId, RegionNumber};
+use strum::Display;
+use table::metadata::TableId;
 
-use crate::ident::TableIdent;
+use crate::table_name::TableName;
 use crate::{ClusterId, DatanodeId};
 
 #[derive(Eq, Hash, PartialEq, Clone, Debug, Serialize, Deserialize)]
 pub struct RegionIdent {
     pub cluster_id: ClusterId,
     pub datanode_id: DatanodeId,
-    pub table_ident: TableIdent,
-    pub region_number: u32,
+    pub table_id: TableId,
+    pub region_number: RegionNumber,
+    pub engine: String,
+}
+
+impl RegionIdent {
+    pub fn get_region_id(&self) -> RegionId {
+        RegionId::new(self.table_id, self.region_number)
+    }
 }
 
 impl Display for RegionIdent {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "RegionIdent(datanode_id='{}.{}', table_id='{}', table_name='{}.{}.{}', table_engine='{}', region_no='{}')",
-            self.cluster_id,
-            self.datanode_id,
-            self.table_ident.table_id,
-            self.table_ident.catalog,
-            self.table_ident.schema,
-            self.table_ident.table,
-            self.table_ident.engine,
-            self.region_number
+            "RegionIdent(datanode_id='{}.{}', table_id={}, region_number={}, engine = {})",
+            self.cluster_id, self.datanode_id, self.table_id, self.region_number, self.engine
         )
-    }
-}
-
-impl From<RegionIdent> for TableIdent {
-    fn from(region_ident: RegionIdent) -> Self {
-        region_ident.table_ident
     }
 }
 
@@ -62,22 +59,37 @@ impl Display for SimpleReply {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Instruction {
-    OpenRegion(RegionIdent),
-    CloseRegion(RegionIdent),
-    InvalidateTableCache(TableIdent),
+impl Display for OpenRegion {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenRegion(region_ident={}, region_storage_path={})",
+            self.region_ident, self.region_storage_path
+        )
+    }
 }
 
-impl Display for Instruction {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OpenRegion(region) => write!(f, "Instruction::OpenRegion({})", region),
-            Self::CloseRegion(region) => write!(f, "Instruction::CloseRegion({})", region),
-            Self::InvalidateTableCache(table) => write!(f, "Instruction::Invalidate({})", table),
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenRegion {
+    pub region_ident: RegionIdent,
+    pub region_storage_path: String,
+}
+
+impl OpenRegion {
+    pub fn new(region_ident: RegionIdent, path: &str) -> Self {
+        Self {
+            region_ident,
+            region_storage_path: path.to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Display)]
+pub enum Instruction {
+    OpenRegion(OpenRegion),
+    CloseRegion(RegionIdent),
+    InvalidateTableIdCache(TableId),
+    InvalidateTableNameCache(TableName),
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -106,43 +118,36 @@ mod tests {
 
     #[test]
     fn test_serialize_instruction() {
-        let open_region = Instruction::OpenRegion(RegionIdent {
-            cluster_id: 1,
-            datanode_id: 2,
-            table_ident: TableIdent {
-                catalog: "foo".to_string(),
-                schema: "bar".to_string(),
-                table: "hi".to_string(),
+        let open_region = Instruction::OpenRegion(OpenRegion::new(
+            RegionIdent {
+                cluster_id: 1,
+                datanode_id: 2,
                 table_id: 1024,
-                engine: "mito".to_string(),
+                region_number: 1,
+                engine: "mito2".to_string(),
             },
-            region_number: 1,
-        });
+            "test/foo",
+        ));
 
         let serialized = serde_json::to_string(&open_region).unwrap();
 
         assert_eq!(
-            r#"{"type":"open_region","cluster_id":1,"datanode_id":2,"table_ident":{"catalog":"foo","schema":"bar","table":"hi","table_id":1024,"engine":"mito"},"region_number":1}"#,
+            r#"{"OpenRegion":{"region_ident":{"cluster_id":1,"datanode_id":2,"table_id":1024,"region_number":1,"engine":"mito2"},"region_storage_path":"test/foo"}}"#,
             serialized
         );
 
         let close_region = Instruction::CloseRegion(RegionIdent {
             cluster_id: 1,
             datanode_id: 2,
-            table_ident: TableIdent {
-                catalog: "foo".to_string(),
-                schema: "bar".to_string(),
-                table: "hi".to_string(),
-                table_id: 1024,
-                engine: "mito".to_string(),
-            },
+            table_id: 1024,
             region_number: 1,
+            engine: "mito2".to_string(),
         });
 
         let serialized = serde_json::to_string(&close_region).unwrap();
 
         assert_eq!(
-            r#"{"type":"close_region","cluster_id":1,"datanode_id":2,"table_ident":{"catalog":"foo","schema":"bar","table":"hi","table_id":1024,"engine":"mito"},"region_number":1}"#,
+            r#"{"CloseRegion":{"cluster_id":1,"datanode_id":2,"table_id":1024,"region_number":1,"engine":"mito2"}}"#,
             serialized
         );
     }

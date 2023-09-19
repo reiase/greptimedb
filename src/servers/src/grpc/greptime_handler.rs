@@ -27,7 +27,7 @@ use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use common_query::Output;
 use common_runtime::Runtime;
-use common_telemetry::logging;
+use common_telemetry::{logging, TRACE_ID};
 use metrics::{histogram, increment_counter};
 use session::context::{QueryContextBuilder, QueryContextRef};
 use snafu::{OptionExt, ResultExt};
@@ -71,9 +71,10 @@ impl GreptimeRequestHandler {
         query_ctx.set_current_user(user_info);
 
         let handler = self.handler.clone();
-        let request_type = request_type(&query);
+        let request_type = request_type(&query).to_string();
         let db = query_ctx.get_db_string();
         let timer = RequestTimer::new(db.clone(), request_type);
+        let trace_id = query_ctx.trace_id();
 
         // Executes requests in another runtime to
         // 1. prevent the execution from being cancelled unexpected by Tonic runtime;
@@ -82,7 +83,7 @@ impl GreptimeRequestHandler {
         //   - Obtaining a `JoinHandle` to get the panic message (if there's any).
         //     From its docs, `JoinHandle` is cancel safe. The task keeps running even it's handle been dropped.
         // 2. avoid the handler blocks the gRPC runtime incidentally.
-        let handle = self.runtime.spawn(async move {
+        let handle = self.runtime.spawn(TRACE_ID.scope(trace_id, async move {
             handler.do_query(query, query_ctx).await.map_err(|e| {
                 if e.status_code().should_log_error() {
                     logging::error!(e; "Failed to handle request");
@@ -92,7 +93,7 @@ impl GreptimeRequestHandler {
                 }
                 e
             })
-        });
+        }));
 
         handle.await.context(JoinTaskSnafu).map_err(|e| {
             timer.record(e.status_code());
@@ -170,7 +171,7 @@ pub(crate) fn create_query_context(header: Option<&RequestHeader>) -> QueryConte
     QueryContextBuilder::default()
         .current_catalog(catalog.to_string())
         .current_schema(schema.to_string())
-        .try_trace_id(header.and_then(|h: &RequestHeader| h.trace_id))
+        .try_trace_id(header.map(|h| h.trace_id))
         .build()
 }
 
@@ -180,13 +181,13 @@ pub(crate) fn create_query_context(header: Option<&RequestHeader>) -> QueryConte
 pub(crate) struct RequestTimer {
     start: Instant,
     db: String,
-    request_type: &'static str,
+    request_type: String,
     status_code: StatusCode,
 }
 
 impl RequestTimer {
     /// Returns a new timer.
-    pub fn new(db: String, request_type: &'static str) -> RequestTimer {
+    pub fn new(db: String, request_type: String) -> RequestTimer {
         RequestTimer {
             start: Instant::now(),
             db,
@@ -208,7 +209,7 @@ impl Drop for RequestTimer {
             self.start.elapsed(),
             &[
                 (METRIC_DB_LABEL, std::mem::take(&mut self.db)),
-                (METRIC_TYPE_LABEL, self.request_type.to_string()),
+                (METRIC_TYPE_LABEL, std::mem::take(&mut self.request_type)),
                 (METRIC_CODE_LABEL, self.status_code.to_string())
             ]
         );

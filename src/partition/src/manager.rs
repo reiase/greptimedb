@@ -15,25 +15,23 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use api::v1::RowInsertRequest;
+use api::v1::Rows;
+use common_meta::key::table_route::TableRouteManager;
+use common_meta::kv_backend::KvBackendRef;
 use common_meta::peer::Peer;
-use common_meta::rpc::router::TableRoute;
+use common_meta::rpc::router::{convert_to_region_map, RegionRoutes};
 use common_query::prelude::Expr;
 use datafusion_expr::{BinaryExpr, Expr as DfExpr, Operator};
 use datatypes::prelude::Value;
-use datatypes::schema::Schema;
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::storage::{RegionId, RegionNumber};
 use table::metadata::TableId;
-use table::requests::{DeleteRequest, InsertRequest};
 
 use crate::columns::RangeColumnsPartitionRule;
 use crate::error::{FindLeaderSnafu, Result};
 use crate::partition::{PartitionBound, PartitionDef, PartitionExpr};
 use crate::range::RangePartitionRule;
-use crate::route::TableRoutes;
-use crate::row_splitter::{RowInsertRequestSplits, RowSplitter};
-use crate::splitter::{DeleteRequestSplit, InsertRequestSplit, WriteSplitter};
+use crate::splitter::RowSplitter;
 use crate::{error, PartitionRuleRef};
 
 #[async_trait::async_trait]
@@ -50,7 +48,7 @@ pub type PartitionRuleManagerRef = Arc<PartitionRuleManager>;
 /// - values (in case of insertion)
 /// - filters (in case of select, deletion and update)
 pub struct PartitionRuleManager {
-    table_routes: Arc<TableRoutes>,
+    table_route_manager: TableRouteManager,
 }
 
 #[derive(Debug)]
@@ -59,25 +57,23 @@ pub struct PartitionInfo {
     pub partition: PartitionDef,
 }
 
-#[async_trait::async_trait]
-impl TableRouteCacheInvalidator for PartitionRuleManager {
-    async fn invalidate_table_route(&self, table: TableId) {
-        self.table_routes.invalidate_table_route(table).await
-    }
-}
-
 impl PartitionRuleManager {
-    pub fn new(table_routes: Arc<TableRoutes>) -> Self {
-        Self { table_routes }
-    }
-
-    pub fn table_routes(&self) -> &TableRoutes {
-        self.table_routes.as_ref()
+    pub fn new(kv_backend: KvBackendRef) -> Self {
+        Self {
+            table_route_manager: TableRouteManager::new(kv_backend),
+        }
     }
 
     /// Find table route of given table name.
-    pub async fn find_table_route(&self, table: TableId) -> Result<Arc<TableRoute>> {
-        self.table_routes.get_route(table).await
+    pub async fn find_table_route(&self, table_id: TableId) -> Result<RegionRoutes> {
+        let route = self
+            .table_route_manager
+            .get(table_id)
+            .await
+            .context(error::TableRouteManagerSnafu)?
+            .context(error::FindTableRoutesSnafu { table_id })?;
+
+        Ok(RegionRoutes(route.region_routes))
     }
 
     /// Find datanodes of corresponding regions of given table.
@@ -86,15 +82,19 @@ impl PartitionRuleManager {
         table_id: TableId,
         regions: Vec<RegionNumber>,
     ) -> Result<HashMap<Peer, Vec<RegionNumber>>> {
-        let route = self.table_routes.get_route(table_id).await?;
+        let route = self
+            .table_route_manager
+            .get(table_id)
+            .await
+            .context(error::TableRouteManagerSnafu)?
+            .context(error::FindTableRoutesSnafu { table_id })?;
         let mut datanodes = HashMap::with_capacity(regions.len());
+        let region_map = convert_to_region_map(&route.region_routes);
         for region in regions.iter() {
-            let datanode = route
-                .find_region_leader(*region)
-                .context(error::FindDatanodeSnafu {
-                    table_id,
-                    region: *region,
-                })?;
+            let datanode = *region_map.get(region).context(error::FindDatanodeSnafu {
+                table_id,
+                region: *region,
+            })?;
             datanodes
                 .entry(datanode.clone())
                 .or_insert_with(Vec::new)
@@ -105,8 +105,14 @@ impl PartitionRuleManager {
 
     /// Find all leader peers of given table.
     pub async fn find_table_region_leaders(&self, table_id: TableId) -> Result<Vec<Peer>> {
-        let route = self.table_routes.get_route(table_id).await?;
+        let route = self
+            .table_route_manager
+            .get(table_id)
+            .await
+            .context(error::TableRouteManagerSnafu)?
+            .context(error::FindTableRoutesSnafu { table_id })?;
         let mut peers = Vec::with_capacity(route.region_routes.len());
+
         for peer in &route.region_routes {
             peers.push(peer.leader_peer.clone().with_context(|| FindLeaderSnafu {
                 region_id: peer.region.id,
@@ -118,7 +124,12 @@ impl PartitionRuleManager {
     }
 
     pub async fn find_table_partitions(&self, table_id: TableId) -> Result<Vec<PartitionInfo>> {
-        let route = self.table_routes.get_route(table_id).await?;
+        let route = self
+            .table_route_manager
+            .get(table_id)
+            .await
+            .context(error::TableRouteManagerSnafu)?
+            .context(error::FindTableRoutesSnafu { table_id })?;
         ensure!(
             !route.region_routes.is_empty(),
             error::FindTableRoutesSnafu { table_id }
@@ -236,39 +247,24 @@ impl PartitionRuleManager {
         Ok(regions)
     }
 
-    /// Split [InsertRequest] into [InsertRequestSplit] according to the partition rule
-    /// of given table.
-    pub async fn split_insert_request(
-        &self,
-        table: TableId,
-        req: InsertRequest,
-        schema: &Schema,
-    ) -> Result<InsertRequestSplit> {
-        let partition_rule = self.find_table_partition_rule(table).await?;
-        let splitter = WriteSplitter::with_partition_rule(partition_rule);
-        splitter.split_insert(req, schema)
+    pub async fn find_region_leader(&self, region_id: RegionId) -> Result<Peer> {
+        let table_route = self.find_table_route(region_id.table_id()).await?;
+        let peer = table_route
+            .find_region_leader(region_id.region_number())
+            .with_context(|| FindLeaderSnafu {
+                region_id,
+                table_id: region_id.table_id(),
+            })?;
+        Ok(peer.clone())
     }
 
-    /// Split [RowInsertRequest] into [RowInsertRequestSplits] according to the partition rule
-    /// of given table.
-    pub async fn split_row_insert_request(
+    pub async fn split_rows(
         &self,
-        table: TableId,
-        req: RowInsertRequest,
-    ) -> Result<RowInsertRequestSplits> {
-        let partition_rule = self.find_table_partition_rule(table).await?;
-        RowSplitter::new(partition_rule).split(req)
-    }
-
-    pub async fn split_delete_request(
-        &self,
-        table: TableId,
-        req: DeleteRequest,
-        primary_key_column_names: Vec<&String>,
-    ) -> Result<DeleteRequestSplit> {
-        let partition_rule = self.find_table_partition_rule(table).await?;
-        let splitter = WriteSplitter::with_partition_rule(partition_rule);
-        splitter.split_delete(req, primary_key_column_names)
+        table_id: TableId,
+        rows: Rows,
+    ) -> Result<HashMap<RegionNumber, Rows>> {
+        let partition_rule = self.find_table_partition_rule(table_id).await?;
+        RowSplitter::new(partition_rule).split(rows)
     }
 }
 

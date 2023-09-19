@@ -16,18 +16,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::v1::meta::Peer;
-use catalog::remote::CachedMetaKvBackend;
-use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO_ENGINE};
-use common_meta::ident::TableIdent;
-use common_meta::key::table_name::{TableNameKey, TableNameValue};
+use catalog::kvbackend::{CachedMetaKvBackend, KvBackendCatalogManager};
+use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_meta::key::table_route::TableRouteKey;
 use common_meta::key::{RegionDistribution, TableMetaKey};
-use common_meta::rpc::router::TableRoute;
-use common_meta::rpc::KeyValue;
-use common_meta::RegionIdent;
+use common_meta::{distributed_time_constants, RegionIdent};
 use common_procedure::{watcher, ProcedureWithId};
 use common_query::Output;
 use common_telemetry::info;
-use frontend::catalog::FrontendCatalogManager;
 use frontend::error::Result as FrontendResult;
 use frontend::instance::Instance;
 use futures::TryStreamExt;
@@ -101,7 +97,7 @@ pub async fn test_region_failover(store_type: StorageType) {
 
     let frontend = cluster.frontend.clone();
 
-    prepare_testing_table(&cluster).await;
+    let table_id = prepare_testing_table(&cluster).await;
 
     let results = write_datas(&frontend, logical_timer).await;
     logical_timer += 1000;
@@ -109,12 +105,7 @@ pub async fn test_region_failover(store_type: StorageType) {
         assert!(matches!(result.unwrap(), Output::AffectedRows(1)));
     }
 
-    let cache_key = TableNameKey::new("greptime", "public", "my_table").as_raw_key();
-
-    let cache = get_table_cache(&frontend, &cache_key).unwrap();
-    let table_name_value = TableNameValue::try_from_raw_value(&cache.unwrap().value).unwrap();
-    let table_id = table_name_value.table_id();
-    assert!(get_route_cache(&frontend, table_id).is_some());
+    assert!(has_route_cache(&frontend, table_id).await);
 
     let distribution = find_region_distribution(&cluster, table_id).await;
     info!("Find region distribution: {distribution:?}");
@@ -145,8 +136,7 @@ pub async fn test_region_failover(store_type: StorageType) {
     // Waits for invalidating table cache
     time::sleep(Duration::from_millis(100)).await;
 
-    let route_cache = get_route_cache(&frontend, table_id);
-    assert!(route_cache.is_none());
+    assert!(!has_route_cache(&frontend, table_id).await);
 
     // Inserts data to each datanode after failover
     let frontend = cluster.frontend.clone();
@@ -167,33 +157,24 @@ pub async fn test_region_failover(store_type: StorageType) {
     assert!(success)
 }
 
-fn get_table_cache(instance: &Arc<Instance>, key: &[u8]) -> Option<Option<KeyValue>> {
+async fn has_route_cache(instance: &Arc<Instance>, table_id: TableId) -> bool {
     let catalog_manager = instance
         .catalog_manager()
         .as_any()
-        .downcast_ref::<FrontendCatalogManager>()
+        .downcast_ref::<KvBackendCatalogManager>()
         .unwrap();
 
-    let kvbackend = catalog_manager.backend();
+    let kv_backend = catalog_manager.table_metadata_manager_ref().kv_backend();
 
-    let kvbackend = kvbackend
+    let cache = kv_backend
         .as_any()
         .downcast_ref::<CachedMetaKvBackend>()
-        .unwrap();
-    let cache = kvbackend.cache();
+        .unwrap()
+        .cache();
 
-    Some(cache.get(key))
-}
-
-fn get_route_cache(instance: &Arc<Instance>, table_id: TableId) -> Option<Arc<TableRoute>> {
-    let catalog_manager = instance
-        .catalog_manager()
-        .as_any()
-        .downcast_ref::<FrontendCatalogManager>()
-        .unwrap();
-    let pm = catalog_manager.partition_manager();
-    let cache = pm.table_routes().cache();
-    cache.get(&table_id)
+    cache
+        .get(TableRouteKey::new(table_id).as_raw_key().as_slice())
+        .is_some()
 }
 
 async fn write_datas(instance: &Arc<Instance>, ts: u64) -> Vec<FrontendResult<Output>> {
@@ -245,7 +226,7 @@ async fn assert_writes(instance: &Arc<Instance>) {
     check_output_stream(result.unwrap(), expected).await;
 }
 
-async fn prepare_testing_table(cluster: &GreptimeDbCluster) {
+async fn prepare_testing_table(cluster: &GreptimeDbCluster) -> TableId {
     let sql = r"
 CREATE TABLE my_table (
     i INT PRIMARY KEY,
@@ -258,6 +239,15 @@ CREATE TABLE my_table (
 )";
     let result = cluster.frontend.do_query(sql, QueryContext::arc()).await;
     result.get(0).unwrap().as_ref().unwrap();
+
+    let table = cluster
+        .frontend
+        .catalog_manager()
+        .table(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, "my_table")
+        .await
+        .unwrap()
+        .unwrap();
+    table.table_info().table_id()
 }
 
 async fn find_region_distribution(
@@ -318,14 +308,9 @@ fn choose_failed_region(distribution: RegionDistribution) -> RegionIdent {
     RegionIdent {
         cluster_id: 1000,
         datanode_id: failed_datanode,
-        table_ident: TableIdent {
-            table_id: 1025,
-            engine: MITO_ENGINE.to_string(),
-            catalog: DEFAULT_CATALOG_NAME.to_string(),
-            schema: DEFAULT_SCHEMA_NAME.to_string(),
-            table: "my_table".to_string(),
-        },
+        table_id: 1025,
         region_number: failed_region,
+        engine: "mito2".to_string(),
     }
 }
 
@@ -354,17 +339,16 @@ async fn run_region_failover_procedure(
     let procedure = RegionFailoverProcedure::new(
         failed_region.clone(),
         RegionFailoverContext {
+            region_lease_secs: 10,
             in_memory: meta_srv.in_memory().clone(),
             mailbox: meta_srv.mailbox().clone(),
             selector,
             selector_ctx: SelectorContext {
-                datanode_lease_secs: meta_srv.options().datanode_lease_secs,
+                datanode_lease_secs: distributed_time_constants::REGION_LEASE_SECS,
                 server_addr: meta_srv.options().server_addr.clone(),
                 kv_store: meta_srv.kv_store().clone(),
                 meta_peer_client: meta_srv.meta_peer_client().clone(),
-                catalog: None,
-                schema: None,
-                table: None,
+                table_id: None,
             },
             dist_lock: meta_srv.lock().clone(),
             table_metadata_manager: meta_srv.table_metadata_manager().clone(),

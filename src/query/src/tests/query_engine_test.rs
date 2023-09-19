@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use catalog::local::MemoryCatalogManager;
+use catalog::memory::MemoryCatalogManager;
 use catalog::RegisterTableRequest;
 use common_base::Plugins;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, NUMBERS_TABLE_ID};
@@ -44,10 +44,10 @@ use crate::tests::pow::pow;
 #[tokio::test]
 async fn test_datafusion_query_engine() -> Result<()> {
     common_telemetry::init_default_ut_logging();
-    let catalog_list = catalog::local::new_memory_catalog_manager()
+    let catalog_list = catalog::memory::new_memory_catalog_manager()
         .map_err(BoxedError::new)
         .context(QueryExecutionSnafu)?;
-    let factory = QueryEngineFactory::new(catalog_list, false);
+    let factory = QueryEngineFactory::new(catalog_list, None, false);
     let engine = factory.query_engine();
 
     let column_schemas = vec![ColumnSchema::new(
@@ -60,7 +60,7 @@ async fn test_datafusion_query_engine() -> Result<()> {
         (0..100).collect::<Vec<_>>(),
     ))];
     let recordbatch = RecordBatch::new(schema, columns).unwrap();
-    let table = Arc::new(MemTable::new("numbers", recordbatch));
+    let table = MemTable::table("numbers", recordbatch);
 
     let limit = 10;
     let table_provider = Arc::new(DfTableProviderAdapter::new(table.clone()));
@@ -104,7 +104,7 @@ async fn test_datafusion_query_engine() -> Result<()> {
 }
 
 fn catalog_manager() -> Result<Arc<MemoryCatalogManager>> {
-    let catalog_manager = catalog::local::new_memory_catalog_manager().unwrap();
+    let catalog_manager = catalog::memory::new_memory_catalog_manager().unwrap();
     let req = RegisterTableRequest {
         catalog: DEFAULT_CATALOG_NAME.to_string(),
         schema: DEFAULT_SCHEMA_NAME.to_string(),
@@ -129,7 +129,7 @@ async fn test_query_validate() -> Result<()> {
     });
     let plugins = Arc::new(plugins);
 
-    let factory = QueryEngineFactory::new_with_plugins(catalog_list, false, None, None, plugins);
+    let factory = QueryEngineFactory::new_with_plugins(catalog_list, None, false, plugins);
     let engine = factory.query_engine();
 
     let stmt = QueryLanguageParser::parse_sql("select number from public.numbers").unwrap();
@@ -153,7 +153,7 @@ async fn test_udf() -> Result<()> {
     common_telemetry::init_default_ut_logging();
     let catalog_list = catalog_manager()?;
 
-    let factory = QueryEngineFactory::new(catalog_list, false);
+    let factory = QueryEngineFactory::new(catalog_list, None, false);
     let engine = factory.query_engine();
 
     let pow = make_scalar_function(pow);

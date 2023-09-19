@@ -18,9 +18,11 @@ use std::fmt::Display;
 use api::helper::values_with_capacity;
 use api::v1::{Column, ColumnDataType, SemanticType};
 use common_base::BitVec;
+use common_time::timestamp::TimeUnit;
 use snafu::ensure;
 
 use crate::error::{Result, TypeMismatchSnafu};
+use crate::Error;
 
 type ColumnName = String;
 
@@ -60,7 +62,7 @@ impl LinesWriter {
         // It is safe to use unwrap here, because values has been initialized in mut_column()
         let values = column.values.as_mut().unwrap();
         values
-            .ts_millisecond_values
+            .timestamp_millisecond_values
             .push(to_ms_ts(value.1, value.0));
         self.null_masks[idx].push(false);
         Ok(())
@@ -259,6 +261,24 @@ impl Display for Precision {
     }
 }
 
+impl TryFrom<Precision> for TimeUnit {
+    type Error = Error;
+
+    fn try_from(precision: Precision) -> std::result::Result<Self, Self::Error> {
+        Ok(match precision {
+            Precision::Second => TimeUnit::Second,
+            Precision::Millisecond => TimeUnit::Millisecond,
+            Precision::Microsecond => TimeUnit::Microsecond,
+            Precision::Nanosecond => TimeUnit::Nanosecond,
+            _ => {
+                return Err(Error::NotSupported {
+                    feat: format!("convert {precision} into TimeUnit"),
+                })
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use api::v1::{ColumnDataType, SemanticType};
@@ -340,7 +360,7 @@ mod tests {
         assert_eq!(SemanticType::Timestamp as i32, column.semantic_type);
         assert_eq!(
             vec![101011000, 102011001, 103011002],
-            column.values.as_ref().unwrap().ts_millisecond_values
+            column.values.as_ref().unwrap().timestamp_millisecond_values
         );
         verify_null_mask(&column.null_mask, vec![false, false, false]);
 

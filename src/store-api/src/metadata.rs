@@ -20,16 +20,20 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use api::helper::ColumnDataTypeWrapper;
+use api::v1::region::RegionColumnDef;
 use api::v1::SemanticType;
 use common_error::ext::ErrorExt;
 use common_error::status_code::StatusCode;
 use datatypes::arrow::datatypes::FieldRef;
 use datatypes::prelude::DataType;
-use datatypes::schema::{ColumnSchema, Schema, SchemaRef};
+use datatypes::schema::{ColumnDefaultConstraint, ColumnSchema, Schema, SchemaRef};
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serialize};
 use snafu::{ensure, Location, OptionExt, ResultExt, Snafu};
 
+use crate::region_request::{AddColumn, AddColumnLocation, AlterKind};
+use crate::storage::consts::is_internal_column;
 use crate::storage::{ColumnId, RegionId};
 
 pub type Result<T> = std::result::Result<T, MetadataError>;
@@ -43,6 +47,39 @@ pub struct ColumnMetadata {
     pub semantic_type: SemanticType,
     /// Immutable and unique id of a region.
     pub column_id: ColumnId,
+}
+
+impl ColumnMetadata {
+    /// Construct `Self` from protobuf struct [RegionColumnDef]
+    pub fn try_from_column_def(column_def: RegionColumnDef) -> Result<Self> {
+        let column_id = column_def.column_id;
+
+        let column_def = column_def
+            .column_def
+            .context(InvalidRawRegionRequestSnafu {
+                err: "column_def is absent",
+            })?;
+
+        let semantic_type = column_def.semantic_type();
+
+        let default_constrain = if column_def.default_constraint.is_empty() {
+            None
+        } else {
+            Some(
+                ColumnDefaultConstraint::try_from(column_def.default_constraint.as_slice())
+                    .context(ConvertDatatypesSnafu)?,
+            )
+        };
+        let data_type = ColumnDataTypeWrapper::new(column_def.data_type()).into();
+        let column_schema = ColumnSchema::new(column_def.name, data_type, column_def.is_nullable)
+            .with_default_constraint(default_constrain)
+            .context(ConvertDatatypesSnafu)?;
+        Ok(Self {
+            column_schema,
+            semantic_type,
+            column_id,
+        })
+    }
 }
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
@@ -92,6 +129,10 @@ pub struct RegionMetadata {
 
     /// Immutable and unique id of a region.
     pub region_id: RegionId,
+    /// Current version of the region schema.
+    ///
+    /// The version starts from 0. Altering the schema bumps the version.
+    pub schema_version: u64,
 }
 
 pub type RegionMetadataRef = Arc<RegionMetadata>;
@@ -107,6 +148,7 @@ impl<'de> Deserialize<'de> for RegionMetadata {
             column_metadatas: Vec<ColumnMetadata>,
             primary_key: Vec<ColumnId>,
             region_id: RegionId,
+            schema_version: u64,
         }
 
         let without_schema = RegionMetadataWithoutSchema::deserialize(deserializer)?;
@@ -120,6 +162,7 @@ impl<'de> Deserialize<'de> for RegionMetadata {
             column_metadatas: without_schema.column_metadatas,
             primary_key: without_schema.primary_key,
             region_id: without_schema.region_id,
+            schema_version: without_schema.schema_version,
         })
     }
 }
@@ -169,6 +212,7 @@ impl RegionMetadata {
             .map(|index| &self.column_metadatas[index])
     }
 
+    /// Returns all primary key columns.
     pub fn primary_key_columns(&self) -> impl Iterator<Item = &ColumnMetadata> {
         // safety: RegionMetadata::validate ensures every primary key exists.
         self.primary_key
@@ -181,6 +225,13 @@ impl RegionMetadata {
         self.column_metadatas
             .iter()
             .filter(|column| column.semantic_type == SemanticType::Field)
+    }
+
+    /// Returns a column's index in primary key if it is a primary key column.
+    ///
+    /// This does a linear search.
+    pub fn primary_key_index(&self, column_id: ColumnId) -> Option<usize> {
+        self.primary_key.iter().position(|id| *id == column_id)
     }
 
     /// Checks whether the metadata is valid.
@@ -197,8 +248,8 @@ impl RegionMetadata {
                 !id_names.contains_key(&col.column_id),
                 InvalidMetaSnafu {
                     reason: format!(
-                        "column {} and {} have the same column id",
-                        id_names[&col.column_id], col.column_schema.name
+                        "column {} and {} have the same column id {}",
+                        id_names[&col.column_id], col.column_schema.name, col.column_id,
                     ),
                 }
             );
@@ -318,6 +369,16 @@ impl RegionMetadata {
             );
         }
 
+        ensure!(
+            !is_internal_column(&column_metadata.column_schema.name),
+            InvalidMetaSnafu {
+                reason: format!(
+                    "{} is internal column name that can not be used",
+                    column_metadata.column_schema.name
+                ),
+            }
+        );
+
         Ok(())
     }
 }
@@ -327,6 +388,7 @@ pub struct RegionMetadataBuilder {
     region_id: RegionId,
     column_metadatas: Vec<ColumnMetadata>,
     primary_key: Vec<ColumnId>,
+    schema_version: u64,
 }
 
 impl RegionMetadataBuilder {
@@ -336,31 +398,50 @@ impl RegionMetadataBuilder {
             region_id: id,
             column_metadatas: vec![],
             primary_key: vec![],
+            schema_version: 0,
         }
     }
 
-    /// Create a builder from existing [RegionMetadata].
+    /// Creates a builder from existing [RegionMetadata].
     pub fn from_existing(existing: RegionMetadata) -> Self {
         Self {
             column_metadatas: existing.column_metadatas,
             primary_key: existing.primary_key,
             region_id: existing.region_id,
+            schema_version: existing.schema_version,
         }
     }
 
-    /// Push a new column metadata to this region's metadata.
+    /// Pushes a new column metadata to this region's metadata.
     pub fn push_column_metadata(&mut self, column_metadata: ColumnMetadata) -> &mut Self {
         self.column_metadatas.push(column_metadata);
         self
     }
 
-    /// Set the primary key of the region.
+    /// Sets the primary key of the region.
     pub fn primary_key(&mut self, key: Vec<ColumnId>) -> &mut Self {
         self.primary_key = key;
         self
     }
 
-    /// Consume the builder and build a [RegionMetadata].
+    /// Increases the schema version by 1.
+    pub fn bump_version(&mut self) -> &mut Self {
+        self.schema_version += 1;
+        self
+    }
+
+    /// Applies the alter `kind` to the builder.
+    ///
+    /// The `kind` should be valid.
+    pub fn alter(&mut self, kind: AlterKind) -> Result<&mut Self> {
+        match kind {
+            AlterKind::AddColumns { columns } => self.add_columns(columns)?,
+            AlterKind::DropColumns { names } => self.drop_columns(&names),
+        }
+        Ok(self)
+    }
+
+    /// Consumes the builder and build a [RegionMetadata].
     pub fn build(self) -> Result<RegionMetadata> {
         let skipped = SkippedFields::new(&self.column_metadatas)?;
 
@@ -371,11 +452,57 @@ impl RegionMetadataBuilder {
             column_metadatas: self.column_metadatas,
             primary_key: self.primary_key,
             region_id: self.region_id,
+            schema_version: self.schema_version,
         };
 
         meta.validate()?;
 
         Ok(meta)
+    }
+
+    /// Adds columns to the metadata.
+    fn add_columns(&mut self, columns: Vec<AddColumn>) -> Result<()> {
+        for add_column in columns {
+            let column_id = add_column.column_metadata.column_id;
+            let semantic_type = add_column.column_metadata.semantic_type;
+            match add_column.location {
+                None => {
+                    self.column_metadatas.push(add_column.column_metadata);
+                }
+                Some(AddColumnLocation::First) => {
+                    self.column_metadatas.insert(0, add_column.column_metadata);
+                }
+                Some(AddColumnLocation::After { column_name }) => {
+                    let pos = self
+                        .column_metadatas
+                        .iter()
+                        .position(|col| col.column_schema.name == column_name)
+                        .context(InvalidRegionRequestSnafu {
+                            region_id: self.region_id,
+                            err: format!(
+                                "column {} not found, failed to add column {} after it",
+                                column_name, add_column.column_metadata.column_schema.name
+                            ),
+                        })?;
+                    // Insert after pos.
+                    self.column_metadatas
+                        .insert(pos + 1, add_column.column_metadata);
+                }
+            }
+            if semantic_type == SemanticType::Tag {
+                // For a new tag, we extend the primary key.
+                self.primary_key.push(column_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Drops columns from the metadata.
+    fn drop_columns(&mut self, names: &[String]) {
+        let name_set: HashSet<_> = names.iter().collect();
+        self.column_metadatas
+            .retain(|col| !name_set.contains(&col.column_schema.name));
     }
 }
 
@@ -443,6 +570,31 @@ pub enum MetadataError {
     SerdeJson {
         location: Location,
         source: serde_json::Error,
+    },
+
+    #[snafu(display(
+        "Failed to convert struct from datatypes, location: {}, source: {}",
+        location,
+        source
+    ))]
+    ConvertDatatypes {
+        location: Location,
+        source: datatypes::error::Error,
+    },
+
+    #[snafu(display("Invalid raw region request, err: {}, location: {}", err, location))]
+    InvalidRawRegionRequest { err: String, location: Location },
+
+    #[snafu(display(
+        "Invalid region request, region_id: {}, err: {}, location: {}",
+        region_id,
+        err,
+        location
+    ))]
+    InvalidRegionRequest {
+        region_id: RegionId,
+        err: String,
+        location: Location,
     },
 }
 
@@ -745,6 +897,135 @@ mod test {
         assert!(
             err.to_string()
                 .contains("number of primary key columns 1 not equal to tag columns 2"),
+            "unexpected err: {err}",
+        );
+    }
+
+    #[test]
+    fn test_bump_version() {
+        let mut region_metadata = build_test_region_metadata();
+        let mut builder = RegionMetadataBuilder::from_existing(region_metadata.clone());
+        builder.bump_version();
+        let new_meta = builder.build().unwrap();
+        region_metadata.schema_version += 1;
+        assert_eq!(region_metadata, new_meta);
+    }
+
+    fn new_column_metadata(name: &str, is_tag: bool, column_id: ColumnId) -> ColumnMetadata {
+        let semantic_type = if is_tag {
+            SemanticType::Tag
+        } else {
+            SemanticType::Field
+        };
+        ColumnMetadata {
+            column_schema: ColumnSchema::new(name, ConcreteDataType::string_datatype(), true),
+            semantic_type,
+            column_id,
+        }
+    }
+
+    fn check_columns(metadata: &RegionMetadata, names: &[&str]) {
+        let actual: Vec<_> = metadata
+            .column_metadatas
+            .iter()
+            .map(|col| &col.column_schema.name)
+            .collect();
+        assert_eq!(names, actual);
+    }
+
+    #[test]
+    fn test_alter() {
+        // a (tag), b (field), c (ts)
+        let metadata = build_test_region_metadata();
+        let mut builder = RegionMetadataBuilder::from_existing(metadata);
+        builder
+            .alter(AlterKind::AddColumns {
+                columns: vec![AddColumn {
+                    column_metadata: new_column_metadata("d", true, 4),
+                    location: None,
+                }],
+            })
+            .unwrap();
+        let metadata = builder.build().unwrap();
+        check_columns(&metadata, &["a", "b", "c", "d"]);
+        assert_eq!([1, 4], &metadata.primary_key[..]);
+
+        let mut builder = RegionMetadataBuilder::from_existing(metadata);
+        builder
+            .alter(AlterKind::AddColumns {
+                columns: vec![AddColumn {
+                    column_metadata: new_column_metadata("e", false, 5),
+                    location: Some(AddColumnLocation::First),
+                }],
+            })
+            .unwrap();
+        let metadata = builder.build().unwrap();
+        check_columns(&metadata, &["e", "a", "b", "c", "d"]);
+
+        let mut builder = RegionMetadataBuilder::from_existing(metadata);
+        builder
+            .alter(AlterKind::AddColumns {
+                columns: vec![AddColumn {
+                    column_metadata: new_column_metadata("f", false, 6),
+                    location: Some(AddColumnLocation::After {
+                        column_name: "b".to_string(),
+                    }),
+                }],
+            })
+            .unwrap();
+        let metadata = builder.build().unwrap();
+        check_columns(&metadata, &["e", "a", "b", "f", "c", "d"]);
+
+        let mut builder = RegionMetadataBuilder::from_existing(metadata);
+        builder
+            .alter(AlterKind::AddColumns {
+                columns: vec![AddColumn {
+                    column_metadata: new_column_metadata("g", false, 7),
+                    location: Some(AddColumnLocation::After {
+                        column_name: "d".to_string(),
+                    }),
+                }],
+            })
+            .unwrap();
+        let metadata = builder.build().unwrap();
+        check_columns(&metadata, &["e", "a", "b", "f", "c", "d", "g"]);
+
+        let mut builder = RegionMetadataBuilder::from_existing(metadata);
+        builder
+            .alter(AlterKind::DropColumns {
+                names: vec!["g".to_string(), "e".to_string()],
+            })
+            .unwrap();
+        let metadata = builder.build().unwrap();
+        check_columns(&metadata, &["a", "b", "f", "c", "d"]);
+
+        let mut builder = RegionMetadataBuilder::from_existing(metadata);
+        builder
+            .alter(AlterKind::DropColumns {
+                names: vec!["a".to_string()],
+            })
+            .unwrap();
+        // Build returns error as the primary key has more columns.
+        let err = builder.build().unwrap_err();
+        assert_eq!(StatusCode::InvalidArguments, err.status_code());
+    }
+
+    #[test]
+    fn test_invalid_column_name() {
+        let mut builder = create_builder();
+        builder.push_column_metadata(ColumnMetadata {
+            column_schema: ColumnSchema::new(
+                "__sequence",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            ),
+            semantic_type: SemanticType::Timestamp,
+            column_id: 1,
+        });
+        let err = builder.build().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("internal column name that can not be used"),
             "unexpected err: {err}",
         );
     }

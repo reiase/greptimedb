@@ -14,8 +14,13 @@
 
 //! Common structs and utilities for reading data.
 
+pub mod compat;
 pub mod merge;
+pub mod projection;
+pub(crate) mod scan_region;
+pub(crate) mod seq_scan;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use api::v1::OpType;
@@ -31,6 +36,7 @@ use datatypes::vectors::{
     BooleanVector, Helper, UInt32Vector, UInt64Vector, UInt8Vector, Vector, VectorRef,
 };
 use snafu::{ensure, OptionExt, ResultExt};
+use store_api::metadata::RegionMetadata;
 use store_api::storage::{ColumnId, SequenceNumber};
 
 use crate::error::{
@@ -38,10 +44,10 @@ use crate::error::{
 };
 use crate::memtable::BoxedBatchIterator;
 
-/// Storage internal representation of a batch of rows
-/// for a primary key (time series).
+/// Storage internal representation of a batch of rows for a primary key (time series).
 ///
-/// Rows are sorted by primary key, timestamp, sequence desc, op_type desc.
+/// Rows are sorted by primary key, timestamp, sequence desc, op_type desc. Fields
+/// always keep the same relative order as fields in [RegionMetadata](store_api::metadata::RegionMetadata).
 #[derive(Debug, PartialEq, Clone)]
 pub struct Batch {
     /// Primary key encoded in a comparable form.
@@ -72,6 +78,17 @@ impl Batch {
         BatchBuilder::with_required_columns(primary_key, timestamps, sequences, op_types)
             .with_fields(fields)
             .build()
+    }
+
+    /// Tries to set fields for the batch.
+    pub fn with_fields(self, fields: Vec<BatchColumn>) -> Result<Batch> {
+        Batch::new(
+            self.primary_key,
+            self.timestamps,
+            self.sequences,
+            self.op_types,
+            fields,
+        )
     }
 
     /// Returns primary key of the batch.
@@ -147,6 +164,11 @@ impl Batch {
         Some(self.get_sequence(self.sequences.len() - 1))
     }
 
+    /// Replaces the primary key of the batch.
+    pub fn set_primary_key(&mut self, primary_key: Vec<u8>) {
+        self.primary_key = primary_key;
+    }
+
     /// Slice the batch, returning a new batch.
     ///
     /// # Panics
@@ -199,15 +221,22 @@ impl Batch {
                 reason: "batches have different primary key",
             }
         );
-        ensure!(
-            batches
-                .iter()
-                .skip(1)
-                .all(|b| b.fields().len() == first.fields().len()),
-            InvalidBatchSnafu {
-                reason: "batches have different field num",
+        for b in batches.iter().skip(1) {
+            ensure!(
+                b.fields.len() == first.fields.len(),
+                InvalidBatchSnafu {
+                    reason: "batches have different field num",
+                }
+            );
+            for (l, r) in b.fields.iter().zip(&first.fields) {
+                ensure!(
+                    l.column_id == r.column_id,
+                    InvalidBatchSnafu {
+                        reason: "batches have different fields",
+                    }
+                );
             }
-        );
+        }
 
         // We take the primary key from the first batch.
         let mut builder = BatchBuilder::new(primary_key);
@@ -306,6 +335,24 @@ impl Batch {
 
         let indices = UInt32Vector::from_iter_values(to_sort.iter().map(|v| v.0 as u32));
         self.take_in_place(&indices)
+    }
+
+    /// Returns ids of fields in the [Batch] after applying the `projection`.
+    pub(crate) fn projected_fields(
+        metadata: &RegionMetadata,
+        projection: &[ColumnId],
+    ) -> Vec<ColumnId> {
+        let projected_ids: HashSet<_> = projection.iter().copied().collect();
+        metadata
+            .field_columns()
+            .filter_map(|column| {
+                if projected_ids.contains(&column.column_id) {
+                    Some(column.column_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Takes the batch in place.
@@ -538,21 +585,6 @@ impl BatchBuilder {
     }
 }
 
-/// Collected [Source] statistics.
-#[derive(Debug, Clone)]
-pub struct SourceStats {
-    /// Number of rows fetched.
-    pub num_rows: usize,
-    /// Min timestamp from fetched batches.
-    ///
-    /// If no rows fetched, the value of the timestamp is i64::MIN.
-    pub min_timestamp: Timestamp,
-    /// Max timestamp from fetched batches.
-    ///
-    /// If no rows fetched, the value of the timestamp is i64::MAX.
-    pub max_timestamp: Timestamp,
-}
-
 /// Async [Batch] reader and iterator wrapper.
 ///
 /// This is the data source for SST writers or internal readers.
@@ -571,12 +603,6 @@ impl Source {
             Source::Iter(iter) => iter.next().transpose(),
         }
     }
-
-    // TODO(yingwen): Remove this method once we support collecting stats in the writer.
-    /// Returns statisics of fetched batches.
-    pub(crate) fn stats(&self) -> SourceStats {
-        unimplemented!()
-    }
 }
 
 /// Async batch reader.
@@ -584,8 +610,6 @@ impl Source {
 /// The reader must guarantee [Batch]es returned by it have the same schema.
 #[async_trait]
 pub trait BatchReader: Send {
-    // TODO(yingwen): fields of the batch returned.
-
     /// Fetch next [Batch].
     ///
     /// Returns `Ok(None)` when the reader has reached its end and calling `next_batch()`
@@ -740,6 +764,37 @@ mod tests {
         let batch1 = new_batch(&[1], &[1], &[OpType::Put], &[1]);
         let mut batch2 = new_batch(&[2], &[2], &[OpType::Put], &[2]);
         batch2.primary_key = b"hello".to_vec();
+        let err = Batch::concat(vec![batch1, batch2]).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidBatch { .. }),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn test_concat_different_fields() {
+        let batch1 = new_batch(&[1], &[1], &[OpType::Put], &[1]);
+        let fields = vec![
+            batch1.fields()[0].clone(),
+            BatchColumn {
+                column_id: 2,
+                data: Arc::new(UInt64Vector::from_slice([2])),
+            },
+        ];
+        // Batch 2 has more fields.
+        let batch2 = batch1.clone().with_fields(fields).unwrap();
+        let err = Batch::concat(vec![batch1.clone(), batch2]).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidBatch { .. }),
+            "unexpected err: {err}"
+        );
+
+        // Batch 2 has different field.
+        let fields = vec![BatchColumn {
+            column_id: 2,
+            data: Arc::new(UInt64Vector::from_slice([2])),
+        }];
+        let batch2 = batch1.clone().with_fields(fields).unwrap();
         let err = Batch::concat(vec![batch1, batch2]).unwrap_err();
         assert!(
             matches!(err, Error::InvalidBatch { .. }),

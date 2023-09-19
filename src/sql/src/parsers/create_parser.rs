@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
+use common_catalog::consts::default_engine;
 use itertools::Itertools;
 use once_cell::sync::Lazy;
 use snafu::{ensure, OptionExt, ResultExt};
@@ -23,22 +25,25 @@ use sqlparser::keywords::ALL_KEYWORDS;
 use sqlparser::parser::IsOptional::Mandatory;
 use sqlparser::parser::{Parser, ParserError};
 use sqlparser::tokenizer::{Token, TokenWithLocation, Word};
+use table::requests::valid_table_option;
 
 use crate::ast::{ColumnDef, Ident, TableConstraint, Value as SqlValue};
 use crate::error::{
-    self, InvalidColumnOptionSnafu, InvalidTimeIndexSnafu, MissingTimeIndexSnafu, Result,
-    SyntaxSnafu,
+    self, InvalidColumnOptionSnafu, InvalidTableOptionSnafu, InvalidTimeIndexSnafu,
+    MissingTimeIndexSnafu, Result, SyntaxSnafu,
 };
 use crate::parser::ParserContext;
 use crate::statements::create::{
     CreateDatabase, CreateExternalTable, CreateTable, PartitionEntry, Partitions, TIME_INDEX,
 };
 use crate::statements::statement::Statement;
-use crate::statements::{sql_data_type_to_concrete_data_type, sql_value_to_value};
+use crate::statements::{
+    get_data_type_by_alias_name, sql_data_type_to_concrete_data_type, sql_value_to_value,
+};
 use crate::util::parse_option_string;
 
-const ENGINE: &str = "ENGINE";
-const MAXVALUE: &str = "MAXVALUE";
+pub const ENGINE: &str = "ENGINE";
+pub const MAXVALUE: &str = "MAXVALUE";
 
 static LESS: Lazy<Token> = Lazy::new(|| Token::make_keyword("LESS"));
 static THAN: Lazy<Token> = Lazy::new(|| Token::make_keyword("THAN"));
@@ -77,7 +82,7 @@ impl<'a> ParserContext<'a> {
                 actual: self.peek_token_as_string(),
             })?;
         let (columns, constraints) = self.parse_columns()?;
-        let engine = self.parse_table_engine(common_catalog::consts::IMMUTABLE_FILE_ENGINE)?;
+        let engine = self.parse_table_engine(common_catalog::consts::FILE_ENGINE)?;
         let options = self
             .parser
             .parse_options(Keyword::WITH)
@@ -90,13 +95,20 @@ impl<'a> ParserContext<'a> {
                     None
                 }
             })
-            .collect();
-
+            .collect::<HashMap<String, String>>();
+        for key in options.keys() {
+            ensure!(
+                valid_table_option(key),
+                InvalidTableOptionSnafu {
+                    key: key.to_string()
+                }
+            );
+        }
         Ok(Statement::CreateExternalTable(CreateExternalTable {
             name: table_name,
             columns,
             constraints,
-            options,
+            options: options.into(),
             if_not_exists,
             engine,
         }))
@@ -143,12 +155,19 @@ impl<'a> ParserContext<'a> {
 
         let partitions = self.parse_partitions()?;
 
-        let engine = self.parse_table_engine(common_catalog::consts::MITO_ENGINE)?;
+        let engine = self.parse_table_engine(default_engine())?;
         let options = self
             .parser
             .parse_options(Keyword::WITH)
             .context(error::SyntaxSnafu { sql: self.sql })?;
-
+        for option in options.iter() {
+            ensure!(
+                valid_table_option(&option.name.value),
+                InvalidTableOptionSnafu {
+                    key: option.name.value.to_string()
+                }
+            );
+        }
         let create_table = CreateTable {
             if_not_exists,
             name: table_name,
@@ -357,14 +376,14 @@ impl<'a> ParserContext<'a> {
                     msg: "time index column can't be null",
                 }
             );
+
+            // The timestamp type may be an alias type, we have to retrieve the actual type.
+            let data_type = get_real_timestamp_type(&column.data_type);
             ensure!(
-                matches!(
-                    column.data_type,
-                    DataType::Timestamp(_, _) | DataType::BigInt(_)
-                ),
+                matches!(data_type, DataType::Timestamp(_, _)),
                 InvalidColumnOptionSnafu {
                     name: column.name.to_string(),
-                    msg: "time index column data type should be timestamp or bigint",
+                    msg: "time index column data type should be timestamp",
                 }
             );
 
@@ -597,8 +616,7 @@ fn validate_time_index(create_table: &CreateTable) -> Result<()> {
             } = c
             {
                 if ident.value == TIME_INDEX {
-                    let column_names = columns.iter().map(|c| &c.value).collect::<Vec<_>>();
-                    Some(column_names)
+                    Some(columns)
                 } else {
                     None
                 }
@@ -626,7 +644,43 @@ fn validate_time_index(create_table: &CreateTable) -> Result<()> {
         }
     );
 
+    // It's safe to use time_index_constraints[0][0],
+    // we already check the bound above.
+    let time_index_column_ident = &time_index_constraints[0][0];
+    let time_index_column = create_table
+        .columns
+        .iter()
+        .find(|c| c.name.value == *time_index_column_ident.value)
+        .with_context(|| InvalidTimeIndexSnafu {
+            msg: format!(
+                "time index column {} not found in columns",
+                time_index_column_ident
+            ),
+        })?;
+
+    let time_index_data_type = get_real_timestamp_type(&time_index_column.data_type);
+    ensure!(
+        matches!(time_index_data_type, DataType::Timestamp(_, _)),
+        InvalidColumnOptionSnafu {
+            name: time_index_column.name.to_string(),
+            msg: "time index column data type should be timestamp",
+        }
+    );
+
     Ok(())
+}
+
+fn get_real_timestamp_type(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Custom(name, tokens) if name.0.len() == 1 && tokens.is_empty() => {
+            if let Some(real_type) = get_data_type_by_alias_name(name.0[0].value.as_str()) {
+                real_type
+            } else {
+                data_type.clone()
+            }
+        }
+        _ => data_type.clone(),
+    }
 }
 
 fn validate_partitions(columns: &[ColumnDef], partitions: &Partitions) -> Result<()> {
@@ -782,11 +836,29 @@ mod tests {
     use std::assert_matches::assert_matches;
     use std::collections::HashMap;
 
-    use common_catalog::consts::IMMUTABLE_FILE_ENGINE;
+    use common_catalog::consts::FILE_ENGINE;
     use sqlparser::ast::ColumnOption::NotNull;
 
     use super::*;
     use crate::dialect::GreptimeDbDialect;
+
+    #[test]
+    fn test_validate_external_table_options() {
+        let sql = "CREATE EXTERNAL TABLE city (
+            host string,
+            ts int64,
+            cpu float64 default 0,
+            memory float64,
+            TIME INDEX (ts),
+            PRIMARY KEY(ts, host)
+        ) with(location='/var/data/city.csv',format='csv',foo='bar');";
+
+        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        assert!(matches!(
+            result,
+            Err(error::Error::InvalidTableOption { .. })
+        ));
+    }
 
     #[test]
     fn test_parse_create_external_table() {
@@ -806,7 +878,7 @@ mod tests {
                     ("location".to_string(), "/var/data/city.csv".to_string()),
                     ("format".to_string(), "csv".to_string()),
                 ]),
-                expected_engine: IMMUTABLE_FILE_ENGINE,
+                expected_engine: FILE_ENGINE,
                 expected_if_not_exist: false,
             },
             Test {
@@ -828,7 +900,7 @@ mod tests {
             match &stmts[0] {
                 Statement::CreateExternalTable(c) => {
                     assert_eq!(c.name.to_string(), test.expected_table_name.to_string());
-                    assert_eq!(c.options, test.expected_options);
+                    assert_eq!(c.options, test.expected_options.into());
                     assert_eq!(c.if_not_exists, test.expected_if_not_exist);
                     assert_eq!(c.engine, test.expected_engine);
                 }
@@ -842,7 +914,7 @@ mod tests {
         let sql = "CREATE EXTERNAL TABLE city (
             host string,
             ts int64,
-            cpu float64 default 0,
+            cpu float32 default 0,
             memory float64,
             TIME INDEX (ts),
             PRIMARY KEY(ts, host)
@@ -858,13 +930,13 @@ mod tests {
         match &stmts[0] {
             Statement::CreateExternalTable(c) => {
                 assert_eq!(c.name.to_string(), "city");
-                assert_eq!(c.options, options);
+                assert_eq!(c.options, options.into());
 
                 let columns = &c.columns;
                 assert_column_def(&columns[0], "host", "STRING");
-                assert_column_def(&columns[1], "ts", "int64");
-                assert_column_def(&columns[2], "cpu", "float64");
-                assert_column_def(&columns[3], "memory", "float64");
+                assert_column_def(&columns[1], "ts", "BIGINT");
+                assert_column_def(&columns[2], "cpu", "FLOAT");
+                assert_column_def(&columns[3], "memory", "DOUBLE");
 
                 let constraints = &c.constraints;
                 assert_matches!(
@@ -923,7 +995,7 @@ mod tests {
     #[test]
     fn test_validate_create() {
         let sql = r"
-CREATE TABLE rcx ( a INT, b STRING, c INT, ts BIGINT TIME INDEX)
+CREATE TABLE rcx ( a INT, b STRING, c INT, ts timestamp TIME INDEX)
 PARTITION BY RANGE COLUMNS(b, a) (
   PARTITION r0 VALUES LESS THAN ('hz', 1000),
   PARTITION r1 VALUES LESS THAN ('sh', 2000),
@@ -1174,7 +1246,7 @@ ENGINE=mito";
 
         assert_ne!(result1, result3);
 
-        // BIGINT as time index
+        // BIGINT can't be time index any more
         let sql1 = r"
 CREATE TABLE monitor (
   host_id    INT,
@@ -1185,27 +1257,12 @@ CREATE TABLE monitor (
   PRIMARY KEY (host),
 )
 ENGINE=mito";
-        let result1 = ParserContext::create_with_dialect(sql1, &GreptimeDbDialect {}).unwrap();
+        let result1 = ParserContext::create_with_dialect(sql1, &GreptimeDbDialect {});
 
-        if let Statement::CreateTable(c) = &result1[0] {
-            assert_eq!(c.constraints.len(), 2);
-            let tc = c.constraints[0].clone();
-            match tc {
-                TableConstraint::Unique {
-                    name,
-                    columns,
-                    is_primary,
-                } => {
-                    assert_eq!(name.unwrap().to_string(), "__time_index");
-                    assert_eq!(columns.len(), 1);
-                    assert_eq!(&columns[0].value, "b");
-                    assert!(!is_primary);
-                }
-                _ => panic!("should be time index constraint"),
-            };
-        } else {
-            panic!("should be create_table statement");
-        }
+        assert!(result1
+            .unwrap_err()
+            .to_string()
+            .contains("time index column data type should be timestamp"));
     }
 
     #[test]
@@ -1384,8 +1441,8 @@ ENGINE=mito";
     pub fn test_parse_create_table() {
         let sql = r"create table demo(
                              host string,
-                             ts int64,
-                             cpu float64 default 0,
+                             ts timestamp,
+                             cpu float32 default 0,
                              memory float64,
                              TIME INDEX (ts),
                              PRIMARY KEY(ts, host)) engine=mito
@@ -1401,9 +1458,10 @@ ENGINE=mito";
                 assert_eq!(4, c.columns.len());
                 let columns = &c.columns;
                 assert_column_def(&columns[0], "host", "STRING");
-                assert_column_def(&columns[1], "ts", "int64");
-                assert_column_def(&columns[2], "cpu", "float64");
-                assert_column_def(&columns[3], "memory", "float64");
+                assert_column_def(&columns[1], "ts", "TIMESTAMP");
+                assert_column_def(&columns[2], "cpu", "FLOAT");
+                assert_column_def(&columns[3], "memory", "DOUBLE");
+
                 let constraints = &c.constraints;
                 assert_matches!(
                     &constraints[0],
@@ -1448,7 +1506,7 @@ ENGINE=mito";
     fn test_duplicated_time_index() {
         let sql = r"create table demo(
                              host string,
-                             ts int64 time index,
+                             ts timestamp time index,
                              t timestamp time index,
                              cpu float64 default 0,
                              memory float64,
@@ -1458,11 +1516,11 @@ ENGINE=mito";
          ";
         let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
         assert!(result.is_err());
-        assert_matches!(result, Err(crate::error::Error::InvalidColumnOption { .. }));
+        assert_matches!(result, Err(crate::error::Error::InvalidTimeIndex { .. }));
 
         let sql = r"create table demo(
                              host string,
-                             ts bigint time index,
+                             ts timestamp time index,
                              cpu float64 default 0,
                              t timestamp,
                              memory float64,
@@ -1477,7 +1535,7 @@ ENGINE=mito";
 
     #[test]
     fn test_invalid_column_name() {
-        let sql = "create table foo(user string, i bigint time index)";
+        let sql = "create table foo(user string, i timestamp time index)";
         let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
         assert!(result
             .unwrap_err()
@@ -1486,7 +1544,7 @@ ENGINE=mito";
 
         // If column name is quoted, it's valid even same with keyword.
         let sql = r#"
-            create table foo("user" string, i bigint time index)
+            create table foo("user" string, i timestamp time index)
         "#;
         let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
         let _ = result.unwrap();

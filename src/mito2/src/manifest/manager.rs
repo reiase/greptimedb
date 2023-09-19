@@ -273,11 +273,14 @@ impl RegionManifestManagerInner {
                     RegionMetaAction::Edit(action) => {
                         manifest_builder.apply_edit(manifest_version, action);
                     }
-                    RegionMetaAction::Remove(_) | RegionMetaAction::Protocol(_) => {
+                    RegionMetaAction::Remove(_) => {
                         debug!(
                             "Unhandled action in {}, action: {:?}",
                             options.manifest_dir, action
                         );
+                    }
+                    RegionMetaAction::Truncate(action) => {
+                        manifest_builder.apply_truncate(manifest_version, action);
                     }
                 }
             }
@@ -323,11 +326,14 @@ impl RegionManifestManagerInner {
                 RegionMetaAction::Edit(action) => {
                     manifest_builder.apply_edit(version, action);
                 }
-                RegionMetaAction::Remove(_) | RegionMetaAction::Protocol(_) => {
+                RegionMetaAction::Remove(_) => {
                     debug!(
                         "Unhandled action for region {}, action: {:?}",
                         self.manifest.metadata.region_id, action
                     );
+                }
+                RegionMetaAction::Truncate(action) => {
+                    manifest_builder.apply_truncate(version, action);
                 }
             }
         }
@@ -394,11 +400,14 @@ impl RegionManifestManagerInner {
                     RegionMetaAction::Edit(action) => {
                         manifest_builder.apply_edit(version, action);
                     }
-                    RegionMetaAction::Remove(_) | RegionMetaAction::Protocol(_) => {
+                    RegionMetaAction::Remove(_) => {
                         debug!(
                             "Unhandled action for region {}, action: {:?}",
                             self.manifest.metadata.region_id, action
                         );
+                    }
+                    RegionMetaAction::Truncate(action) => {
+                        manifest_builder.apply_truncate(version, action);
                     }
                 }
             }
@@ -436,7 +445,7 @@ impl RegionManifestManagerInner {
     ) -> Result<Option<RegionCheckpoint>> {
         let last_checkpoint = store.load_last_checkpoint().await?;
 
-        if let Some((version, bytes)) = last_checkpoint {
+        if let Some((_, bytes)) = last_checkpoint {
             let checkpoint = RegionCheckpoint::decode(&bytes)?;
             Ok(Some(checkpoint))
         } else {

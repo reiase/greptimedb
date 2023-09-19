@@ -20,10 +20,11 @@ mod test {
     use api::v1::ddl_request::Expr as DdlExpr;
     use api::v1::greptime_request::Request;
     use api::v1::query_request::Query;
+    use api::v1::region::QueryRequest as RegionQueryRequest;
     use api::v1::{
         alter_expr, AddColumn, AddColumns, AlterExpr, Column, ColumnDataType, ColumnDef,
         CreateDatabaseExpr, CreateTableExpr, DdlRequest, DeleteRequest, DeleteRequests,
-        DropTableExpr, FlushTableExpr, InsertRequest, InsertRequests, QueryRequest, SemanticType,
+        DropTableExpr, InsertRequest, InsertRequests, QueryRequest, SemanticType,
     };
     use common_catalog::consts::MITO_ENGINE;
     use common_meta::rpc::router::region_distribution;
@@ -31,11 +32,13 @@ mod test {
     use common_recordbatch::RecordBatches;
     use frontend::instance::Instance;
     use query::parser::QueryLanguageParser;
+    use query::plan::LogicalPlan;
     use servers::query_handler::grpc::GrpcQueryHandler;
     use session::context::QueryContext;
-    use store_api::storage::RegionNumber;
-    use tests::{has_parquet_file, test_region_dir};
+    use store_api::storage::RegionId;
+    use substrait::{DFLogicalSubstraitConvertor, SubstraitPlan};
 
+    use crate::standalone::GreptimeDbStandaloneBuilder;
     use crate::tests;
     use crate::tests::MockDistributedInstance;
 
@@ -51,8 +54,9 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_standalone_handle_ddl_request() {
-        let standalone =
-            tests::create_standalone_instance("test_standalone_handle_ddl_request").await;
+        let standalone = GreptimeDbStandaloneBuilder::new("test_standalone_handle_ddl_request")
+            .build()
+            .await;
         let instance = &standalone.instance;
 
         test_handle_ddl_request(instance.as_ref()).await;
@@ -69,6 +73,7 @@ mod test {
             expr: Some(DdlExpr::CreateDatabase(CreateDatabaseExpr {
                 database_name: "database_created_through_grpc".to_string(),
                 create_if_not_exists: true,
+                options: Default::default(),
             })),
         });
         let output = query(instance, request).await;
@@ -82,15 +87,19 @@ mod test {
                 column_defs: vec![
                     ColumnDef {
                         name: "a".to_string(),
-                        datatype: ColumnDataType::String as _,
+                        data_type: ColumnDataType::String as _,
                         is_nullable: true,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Field as i32,
+                        ..Default::default()
                     },
                     ColumnDef {
                         name: "ts".to_string(),
-                        datatype: ColumnDataType::TimestampMillisecond as _,
+                        data_type: ColumnDataType::TimestampMillisecond as _,
                         is_nullable: false,
                         default_constraint: vec![],
+                        semantic_type: SemanticType::Timestamp as i32,
+                        ..Default::default()
                     },
                 ],
                 time_index: "ts".to_string(),
@@ -110,15 +119,15 @@ mod test {
                     add_columns: vec![AddColumn {
                         column_def: Some(ColumnDef {
                             name: "b".to_string(),
-                            datatype: ColumnDataType::Int32 as _,
+                            data_type: ColumnDataType::Int32 as _,
                             is_nullable: true,
                             default_constraint: vec![],
+                            semantic_type: SemanticType::Field as i32,
+                            ..Default::default()
                         }),
-                        is_key: false,
                         location: None,
                     }],
                 })),
-                ..Default::default()
             })),
         });
         let output = query(instance, request).await;
@@ -162,18 +171,17 @@ mod test {
     }
 
     async fn verify_table_is_dropped(instance: &MockDistributedInstance) {
-        for (_, dn) in instance.datanodes().iter() {
-            assert!(dn
-                .catalog_manager()
-                .table(
-                    "greptime",
-                    "database_created_through_grpc",
-                    "table_created_through_grpc"
-                )
-                .await
-                .unwrap()
-                .is_none());
-        }
+        assert!(instance
+            .frontend()
+            .catalog_manager()
+            .table(
+                "greptime",
+                "database_created_through_grpc",
+                "table_created_through_grpc"
+            )
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -190,9 +198,10 @@ mod test {
             r"
 CREATE TABLE {table_name} (
     a INT,
-    b STRING PRIMARY KEY,
+    b STRING,
     ts TIMESTAMP,
-    TIME INDEX (ts)
+    TIME INDEX (ts),
+    PRIMARY KEY (a, b)
 ) PARTITION BY RANGE COLUMNS(a) (
     PARTITION r0 VALUES LESS THAN (10),
     PARTITION r1 VALUES LESS THAN (20),
@@ -278,10 +287,9 @@ CREATE TABLE {table_name} (
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_standalone_insert_and_query() {
-        common_telemetry::init_default_ut_logging();
-
-        let standalone =
-            tests::create_standalone_instance("test_standalone_insert_and_query").await;
+        let standalone = GreptimeDbStandaloneBuilder::new("test_standalone_insert_and_query")
+            .build()
+            .await;
         let instance = &standalone.instance;
 
         let table_name = "my_table";
@@ -293,106 +301,6 @@ CREATE TABLE {table_name} (
         test_insert_delete_and_query_on_auto_created_table(instance).await
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_distributed_flush_table() {
-        common_telemetry::init_default_ut_logging();
-
-        let instance = tests::create_distributed_instance("test_distributed_flush_table").await;
-        let data_tmp_dirs = instance.data_tmp_dirs();
-        let frontend = instance.frontend();
-        let frontend = frontend.as_ref();
-
-        let table_name = "my_dist_table";
-        let sql = format!(
-            r"
-CREATE TABLE {table_name} (
-    a INT,
-    ts TIMESTAMP,
-    TIME INDEX (ts)
-) PARTITION BY RANGE COLUMNS(a) (
-    PARTITION r0 VALUES LESS THAN (10),
-    PARTITION r1 VALUES LESS THAN (20),
-    PARTITION r2 VALUES LESS THAN (50),
-    PARTITION r3 VALUES LESS THAN (MAXVALUE),
-)"
-        );
-        create_table(frontend, sql).await;
-
-        test_insert_delete_and_query_on_existing_table(frontend, table_name).await;
-
-        flush_table(frontend, "greptime", "public", table_name, None).await;
-        // Wait for previous task finished
-        flush_table(frontend, "greptime", "public", table_name, None).await;
-
-        let table = frontend
-            .catalog_manager()
-            .table("greptime", "public", table_name)
-            .await
-            .unwrap()
-            .unwrap();
-        let table_id = table.table_info().table_id();
-
-        let table_route_value = instance
-            .table_metadata_manager()
-            .table_route_manager()
-            .get(table_id)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let region_to_dn_map = region_distribution(&table_route_value.region_routes)
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (v[0], *k))
-            .collect::<HashMap<u32, u64>>();
-
-        for (region, dn) in region_to_dn_map.iter() {
-            // data_tmp_dirs -> dn: 1..4
-            let data_tmp_dir = data_tmp_dirs.get((*dn - 1) as usize).unwrap();
-            let region_dir = test_region_dir(
-                data_tmp_dir.path().to_str().unwrap(),
-                "greptime",
-                "public",
-                table_id,
-                *region,
-            );
-            assert!(has_parquet_file(&region_dir));
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_standalone_flush_table() {
-        common_telemetry::init_default_ut_logging();
-
-        let standalone = tests::create_standalone_instance("test_standalone_flush_table").await;
-        let instance = &standalone.instance;
-        let data_tmp_dir = standalone.data_tmp_dir();
-
-        let table_name = "my_table";
-        let sql = format!("CREATE TABLE {table_name} (a INT, b STRING, ts TIMESTAMP, TIME INDEX (ts), PRIMARY KEY (a, b))");
-
-        create_table(instance, sql).await;
-
-        test_insert_delete_and_query_on_existing_table(instance, table_name).await;
-
-        let table_id = 1024;
-        let region_id = 0;
-        let region_dir = test_region_dir(
-            data_tmp_dir.path().to_str().unwrap(),
-            "greptime",
-            "public",
-            table_id,
-            region_id,
-        );
-        assert!(!has_parquet_file(&region_dir));
-
-        flush_table(instance, "greptime", "public", "my_table", None).await;
-        // Wait for previous task finished
-        flush_table(instance, "greptime", "public", "my_table", None).await;
-
-        assert!(has_parquet_file(&region_dir));
-    }
-
     async fn create_table(frontend: &Instance, sql: String) {
         let request = Request::Query(QueryRequest {
             query: Some(Query::Sql(sql)),
@@ -401,29 +309,8 @@ CREATE TABLE {table_name} (
         assert!(matches!(output, Output::AffectedRows(0)));
     }
 
-    async fn flush_table(
-        frontend: &Instance,
-        catalog_name: &str,
-        schema_name: &str,
-        table_name: &str,
-        region_number: Option<RegionNumber>,
-    ) {
-        let request = Request::Ddl(DdlRequest {
-            expr: Some(DdlExpr::FlushTable(FlushTableExpr {
-                catalog_name: catalog_name.to_string(),
-                schema_name: schema_name.to_string(),
-                table_name: table_name.to_string(),
-                region_number,
-                ..Default::default()
-            })),
-        });
-
-        let output = query(frontend, request).await;
-        assert!(matches!(output, Output::AffectedRows(0)));
-    }
-
     async fn test_insert_delete_and_query_on_existing_table(instance: &Instance, table_name: &str) {
-        let ts_millisecond_values = vec![
+        let timestamp_millisecond_values = vec![
             1672557972000,
             1672557973000,
             1672557974000,
@@ -451,13 +338,13 @@ CREATE TABLE {table_name} (
                         ..Default::default()
                     }),
                     null_mask: vec![32, 0],
-                    semantic_type: SemanticType::Field as i32,
+                    semantic_type: SemanticType::Tag as i32,
                     datatype: ColumnDataType::Int32 as i32,
                 },
                 Column {
                     column_name: "b".to_string(),
                     values: Some(Values {
-                        string_values: ts_millisecond_values
+                        string_values: timestamp_millisecond_values
                             .iter()
                             .map(|x| format!("ts: {x}"))
                             .collect(),
@@ -470,7 +357,7 @@ CREATE TABLE {table_name} (
                 Column {
                     column_name: "ts".to_string(),
                     values: Some(Values {
-                        ts_millisecond_values,
+                        timestamp_millisecond_values,
                         ..Default::default()
                     }),
                     semantic_type: SemanticType::Timestamp as i32,
@@ -479,7 +366,6 @@ CREATE TABLE {table_name} (
                 },
             ],
             row_count: 16,
-            ..Default::default()
         };
         let output = query(
             instance,
@@ -525,11 +411,10 @@ CREATE TABLE {table_name} (
 
         let new_grpc_delete_request = |a, b, ts, row_count| DeleteRequest {
             table_name: table_name.to_string(),
-            region_number: 0,
             key_columns: vec![
                 Column {
                     column_name: "a".to_string(),
-                    semantic_type: SemanticType::Field as i32,
+                    semantic_type: SemanticType::Tag as i32,
                     values: Some(Values {
                         i32_values: a,
                         ..Default::default()
@@ -551,7 +436,7 @@ CREATE TABLE {table_name} (
                     column_name: "ts".to_string(),
                     semantic_type: SemanticType::Timestamp as i32,
                     values: Some(Values {
-                        ts_millisecond_values: ts,
+                        timestamp_millisecond_values: ts,
                         ..Default::default()
                     }),
                     datatype: ColumnDataType::TimestampMillisecond as i32,
@@ -640,22 +525,32 @@ CREATE TABLE {table_name} (
             .collect::<HashMap<u32, u64>>();
         assert_eq!(region_to_dn_map.len(), expected_distribution.len());
 
-        for (region, dn) in region_to_dn_map.iter() {
-            let stmt = QueryLanguageParser::parse_sql(&format!(
-                "SELECT ts, a, b FROM {table_name} ORDER BY ts"
-            ))
+        let stmt = QueryLanguageParser::parse_sql(&format!(
+            "SELECT ts, a, b FROM {table_name} ORDER BY ts"
+        ))
+        .unwrap();
+        let LogicalPlan::DfPlan(plan) = instance
+            .frontend()
+            .statement_executor()
+            .plan(stmt, QueryContext::arc())
+            .await
             .unwrap();
-            let dn = instance.datanodes().get(dn).unwrap();
-            let engine = dn.query_engine();
-            let plan = engine
-                .planner()
-                .plan(stmt, QueryContext::arc())
+        let plan = DFLogicalSubstraitConvertor.encode(&plan).unwrap();
+
+        for (region, dn) in region_to_dn_map.iter() {
+            let region_server = instance.datanodes().get(dn).unwrap().region_server();
+
+            let region_id = RegionId::new(table_id, *region);
+
+            let stream = region_server
+                .handle_read(RegionQueryRequest {
+                    region_id: region_id.as_u64(),
+                    plan: plan.to_vec(),
+                    ..Default::default()
+                })
                 .await
                 .unwrap();
-            let output = engine.execute(plan, QueryContext::arc()).await.unwrap();
-            let Output::Stream(stream) = output else {
-                unreachable!()
-            };
+
             let recordbatches = RecordBatches::try_collect(stream).await.unwrap();
             let actual = recordbatches.pretty_print().unwrap();
 
@@ -681,7 +576,11 @@ CREATE TABLE {table_name} (
                 Column {
                     column_name: "ts".to_string(),
                     values: Some(Values {
-                        ts_millisecond_values: vec![1672557975000, 1672557976000, 1672557977000],
+                        timestamp_millisecond_values: vec![
+                            1672557975000,
+                            1672557976000,
+                            1672557977000,
+                        ],
                         ..Default::default()
                     }),
                     semantic_type: SemanticType::Timestamp as i32,
@@ -690,7 +589,6 @@ CREATE TABLE {table_name} (
                 },
             ],
             row_count: 3,
-            ..Default::default()
         };
 
         // Test auto create not existed table upon insertion.
@@ -716,7 +614,11 @@ CREATE TABLE {table_name} (
                 Column {
                     column_name: "ts".to_string(),
                     values: Some(Values {
-                        ts_millisecond_values: vec![1672557978000, 1672557979000, 1672557980000],
+                        timestamp_millisecond_values: vec![
+                            1672557978000,
+                            1672557979000,
+                            1672557980000,
+                        ],
                         ..Default::default()
                     }),
                     semantic_type: SemanticType::Timestamp as i32,
@@ -725,7 +627,6 @@ CREATE TABLE {table_name} (
                 },
             ],
             row_count: 3,
-            ..Default::default()
         };
 
         // Test auto add not existed column upon insertion.
@@ -760,11 +661,10 @@ CREATE TABLE {table_name} (
 
         let delete = DeleteRequest {
             table_name: "auto_created_table".to_string(),
-            region_number: 0,
             key_columns: vec![Column {
                 column_name: "ts".to_string(),
                 values: Some(Values {
-                    ts_millisecond_values: vec![1672557975000, 1672557979000],
+                    timestamp_millisecond_values: vec![1672557975000, 1672557979000],
                     ..Default::default()
                 }),
                 semantic_type: SemanticType::Timestamp as i32,
@@ -802,9 +702,9 @@ CREATE TABLE {table_name} (
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_promql_query() {
-        common_telemetry::init_default_ut_logging();
-
-        let standalone = tests::create_standalone_instance("test_standalone_promql_query").await;
+        let standalone = GreptimeDbStandaloneBuilder::new("test_standalone_promql_query")
+            .build()
+            .await;
         let instance = &standalone.instance;
 
         let table_name = "my_table";
@@ -846,7 +746,7 @@ CREATE TABLE {table_name} (
                 Column {
                     column_name: "ts".to_string(),
                     values: Some(Values {
-                        ts_millisecond_values: vec![
+                        timestamp_millisecond_values: vec![
                             1672557972000,
                             1672557973000,
                             1672557974000,
@@ -864,7 +764,6 @@ CREATE TABLE {table_name} (
                 },
             ],
             row_count: 8,
-            ..Default::default()
         };
 
         let request = Request::Inserts(InsertRequests {

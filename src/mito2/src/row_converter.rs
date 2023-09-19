@@ -15,7 +15,7 @@
 use bytes::Buf;
 use common_base::bytes::Bytes;
 use common_time::time::Time;
-use common_time::{Date, Interval};
+use common_time::{Date, Duration, Interval};
 use datatypes::data_type::ConcreteDataType;
 use datatypes::prelude::Value;
 use datatypes::value::ValueRef;
@@ -36,10 +36,18 @@ pub trait RowCodec {
     where
         I: Iterator<Item = ValueRef<'a>>;
 
+    /// Encodes rows to specific vec.
+    /// # Note
+    /// Ensure the length of row iterator matches the length of fields.
+    fn encode_to_vec<'a, I>(&self, row: I, buffer: &mut Vec<u8>) -> Result<()>
+    where
+        I: Iterator<Item = ValueRef<'a>>;
+
     /// Decode row values from bytes.
     fn decode(&self, bytes: &[u8]) -> Result<Vec<Value>>;
 }
 
+#[derive(Debug)]
 pub struct SortField {
     data_type: ConcreteDataType,
 }
@@ -64,6 +72,7 @@ impl SortField {
             ConcreteDataType::DateTime(_) => 9,
             ConcreteDataType::Timestamp(_) => 10,
             ConcreteDataType::Time(_) => 10,
+            ConcreteDataType::Duration(_) => 10,
             ConcreteDataType::Interval(_) => 18,
             ConcreteDataType::Null(_)
             | ConcreteDataType::List(_)
@@ -128,7 +137,8 @@ impl SortField {
             Date, date,
             DateTime, datetime,
             Time, time,
-            Interval, interval
+            Interval, interval,
+            Duration, duration
         );
 
         Ok(())
@@ -193,12 +203,14 @@ impl SortField {
             Date, Date,
             Time, Time,
             DateTime, DateTime,
-            Interval, Interval
+            Interval, Interval,
+            Duration, Duration
         )
     }
 }
 
 /// A memory-comparable row [Value] encoder/decoder.
+#[derive(Debug)]
 pub struct McmpRowCodec {
     fields: Vec<SortField>,
 }
@@ -223,12 +235,21 @@ impl RowCodec for McmpRowCodec {
     where
         I: Iterator<Item = ValueRef<'a>>,
     {
-        let mut bytes = Vec::with_capacity(self.estimated_size());
-        let mut serializer = Serializer::new(&mut bytes);
+        let mut buffer = Vec::new();
+        self.encode_to_vec(row, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn encode_to_vec<'a, I>(&self, row: I, buffer: &mut Vec<u8>) -> Result<()>
+    where
+        I: Iterator<Item = ValueRef<'a>>,
+    {
+        buffer.reserve(self.estimated_size());
+        let mut serializer = Serializer::new(buffer);
         for (value, field) in row.zip(self.fields.iter()) {
             field.serialize(&mut serializer, &value)?;
         }
-        Ok(bytes)
+        Ok(())
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<Vec<Value>> {
@@ -291,6 +312,20 @@ mod tests {
                 Value::Int64(43),
             ],
         );
+    }
+
+    #[test]
+    fn test_memcmp_duration() {
+        check_encode_and_decode(
+            &[
+                ConcreteDataType::duration_millisecond_datatype(),
+                ConcreteDataType::int64_datatype(),
+            ],
+            vec![
+                Value::Duration(Duration::new_millisecond(44)),
+                Value::Int64(45),
+            ],
+        )
     }
 
     #[test]

@@ -30,14 +30,14 @@ pub struct FrontendOptions {
     pub mode: Mode,
     pub node_id: Option<String>,
     pub heartbeat: HeartbeatOptions,
-    pub http_options: Option<HttpOptions>,
-    pub grpc_options: Option<GrpcOptions>,
-    pub mysql_options: Option<MysqlOptions>,
-    pub postgres_options: Option<PostgresOptions>,
-    pub opentsdb_options: Option<OpentsdbOptions>,
-    pub influxdb_options: Option<InfluxdbOptions>,
-    pub prom_store_options: Option<PromStoreOptions>,
-    pub meta_client_options: Option<MetaClientOptions>,
+    pub http: HttpOptions,
+    pub grpc: GrpcOptions,
+    pub mysql: MysqlOptions,
+    pub postgres: PostgresOptions,
+    pub opentsdb: OpentsdbOptions,
+    pub influxdb: InfluxdbOptions,
+    pub prom_store: PromStoreOptions,
+    pub meta_client: Option<MetaClientOptions>,
     pub logging: LoggingOptions,
     pub datanode: DatanodeOptions,
 }
@@ -47,15 +47,15 @@ impl Default for FrontendOptions {
         Self {
             mode: Mode::Standalone,
             node_id: None,
-            heartbeat: HeartbeatOptions::default(),
-            http_options: Some(HttpOptions::default()),
-            grpc_options: Some(GrpcOptions::default()),
-            mysql_options: Some(MysqlOptions::default()),
-            postgres_options: Some(PostgresOptions::default()),
-            opentsdb_options: Some(OpentsdbOptions::default()),
-            influxdb_options: Some(InfluxdbOptions::default()),
-            prom_store_options: Some(PromStoreOptions::default()),
-            meta_client_options: None,
+            heartbeat: HeartbeatOptions::frontend_default(),
+            http: HttpOptions::default(),
+            grpc: GrpcOptions::default(),
+            mysql: MysqlOptions::default(),
+            postgres: PostgresOptions::default(),
+            opentsdb: OpentsdbOptions::default(),
+            influxdb: InfluxdbOptions::default(),
+            prom_store: PromStoreOptions::default(),
+            meta_client: None,
             logging: LoggingOptions::default(),
             datanode: DatanodeOptions::default(),
         }
@@ -64,7 +64,7 @@ impl Default for FrontendOptions {
 
 impl FrontendOptions {
     pub fn env_list_keys() -> Option<&'static [&'static str]> {
-        Some(&["meta_client_options.metasrv_addrs"])
+        Some(&["meta_client.metasrv_addrs"])
     }
 
     pub fn to_toml_string(&self) -> String {

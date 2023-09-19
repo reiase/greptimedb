@@ -20,7 +20,6 @@ use crate::error::Result;
 use crate::handler::{HeartbeatAccumulator, HeartbeatHandler};
 use crate::metasrv::Context;
 
-#[derive(Default)]
 pub struct CollectStatsHandler;
 
 #[async_trait::async_trait]
@@ -43,7 +42,10 @@ impl HeartbeatHandler for CollectStatsHandler {
 
         match Stat::try_from(req.clone()) {
             Ok(stat) => {
-                let _ = acc.stat.insert(stat);
+                // If stat is empty, it means the request is a mailbox response
+                if !stat.is_empty() {
+                    let _ = acc.stat.insert(stat);
+                }
             }
             Err(err) => {
                 warn!("Incomplete heartbeat data: {:?}, err: {:?}", req, err);

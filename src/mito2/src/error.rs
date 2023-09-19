@@ -26,6 +26,7 @@ use snafu::{Location, Snafu};
 use store_api::manifest::ManifestVersion;
 use store_api::storage::RegionId;
 
+use crate::sst::file::FileId;
 use crate::worker::WorkerId;
 
 #[derive(Debug, Snafu)]
@@ -104,12 +105,6 @@ pub enum Error {
 
     #[snafu(display("Invalid metadata, {}, location: {}", reason, location))]
     InvalidMeta { reason: String, location: Location },
-
-    #[snafu(display("Invalid schema, source: {}, location: {}", source, location))]
-    InvalidSchema {
-        source: datatypes::error::Error,
-        location: Location,
-    },
 
     #[snafu(display("Invalid region metadata, source: {}, location: {}", source, location))]
     InvalidMetadata {
@@ -269,18 +264,6 @@ pub enum Error {
     #[snafu(display("Failed to write region, source: {}", source))]
     WriteGroup { source: Arc<Error> },
 
-    #[snafu(display(
-        "Row length mismatch, expect: {}, actual: {}, location: {}",
-        expect,
-        actual,
-        location
-    ))]
-    RowLengthMismatch {
-        expect: usize,
-        actual: usize,
-        location: Location,
-    },
-
     #[snafu(display("Row value mismatches field data type"))]
     FieldTypeMismatch { source: datatypes::error::Error },
 
@@ -366,20 +349,119 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Invalid flume sender, location: {}", location,))]
-    InvalidFlumeSender { location: Location },
+    #[snafu(display("Invalid sender, location: {}", location,))]
+    InvalidSender { location: Location },
 
-    #[snafu(display("Invalid scheduler state location: {}", location,))]
+    #[snafu(display("Invalid scheduler state, location: {}", location))]
     InvalidSchedulerState { location: Location },
 
-    #[snafu(display("Failed to stop scheduler, source: {}", source))]
+    #[snafu(display("Failed to stop scheduler, location: {}, source: {}", location, source))]
     StopScheduler {
         source: JoinError,
         location: Location,
     },
+
+    #[snafu(display(
+        "Failed to build scan predicate, location: {}, source: {}",
+        location,
+        source
+    ))]
+    BuildPredicate {
+        source: table::error::Error,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to delete SST file, file id: {}, source: {}", file_id, source))]
+    DeleteSst {
+        file_id: FileId,
+        source: object_store::Error,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to flush region {}, location: {}, source: {}",
+        region_id,
+        location,
+        source
+    ))]
+    FlushRegion {
+        region_id: RegionId,
+        source: Arc<Error>,
+        location: Location,
+    },
+
+    #[snafu(display("Region {} is dropped, location: {}", region_id, location))]
+    RegionDropped {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display("Region {} is closed, location: {}", region_id, location))]
+    RegionClosed {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display("Region {} is truncated, location: {}", region_id, location))]
+    RegionTruncated {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Engine write buffer is full, rejecting write requests of region {}, location: {}",
+        region_id,
+        location
+    ))]
+    RejectWrite {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to compact region {}, location: {}, source:{}",
+        region_id,
+        location,
+        source
+    ))]
+    CompactRegion {
+        region_id: RegionId,
+        source: Arc<Error>,
+        location: Location,
+    },
+
+    #[snafu(display(
+        "Failed to compat readers for region {}, reason: {}, location: {}",
+        region_id,
+        reason,
+        location
+    ))]
+    CompatReader {
+        region_id: RegionId,
+        reason: String,
+        location: Location,
+    },
+
+    #[snafu(display("{}, location: {}", source, location))]
+    InvalidRegionRequest {
+        source: store_api::metadata::MetadataError,
+        location: Location,
+    },
+
+    #[snafu(display("Region {} is read only, location: {}", region_id, location))]
+    RegionReadonly {
+        region_id: RegionId,
+        location: Location,
+    },
+
+    #[snafu(display("Invalid options, source: {}", source))]
+    JsonOptions {
+        source: serde_json::Error,
+        location: Location,
+    },
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
     /// Returns true if we need to fill default value for a region.
@@ -403,15 +485,14 @@ impl ErrorExt for Error {
             | DecompressObject { .. }
             | SerdeJson { .. }
             | Utf8 { .. }
-            | RegionExists { .. }
             | NewRecordBatch { .. }
-            | RegionNotFound { .. }
             | RegionCorrupted { .. }
             | CreateDefault { .. }
             | InvalidParquet { .. } => StatusCode::Unexpected,
+            RegionNotFound { .. } => StatusCode::RegionNotFound,
+            RegionExists { .. } => StatusCode::RegionAlreadyExists,
             InvalidScanIndex { .. }
             | InvalidMeta { .. }
-            | InvalidSchema { .. }
             | InvalidRequest { .. }
             | FillDefault { .. }
             | InvalidMetadata { .. } => StatusCode::InvalidArguments,
@@ -423,7 +504,6 @@ impl ErrorExt for Error {
             | DecodeWal { .. } => StatusCode::Internal,
             WriteBuffer { source, .. } => source.status_code(),
             WriteGroup { source, .. } => source.status_code(),
-            RowLengthMismatch { .. } => StatusCode::InvalidArguments,
             FieldTypeMismatch { source, .. } => source.status_code(),
             SerializeField { .. } => StatusCode::Internal,
             NotSupportedField { .. } => StatusCode::Unsupported,
@@ -434,9 +514,21 @@ impl ErrorExt for Error {
             ComputeArrow { .. } => StatusCode::Internal,
             ComputeVector { .. } => StatusCode::Internal,
             PrimaryKeyLengthMismatch { .. } => StatusCode::InvalidArguments,
-            InvalidFlumeSender { .. } => StatusCode::InvalidArguments,
+            InvalidSender { .. } => StatusCode::InvalidArguments,
             InvalidSchedulerState { .. } => StatusCode::InvalidArguments,
             StopScheduler { .. } => StatusCode::Internal,
+            BuildPredicate { source, .. } => source.status_code(),
+            DeleteSst { .. } => StatusCode::StorageUnavailable,
+            FlushRegion { source, .. } => source.status_code(),
+            RegionDropped { .. } => StatusCode::Cancelled,
+            RegionClosed { .. } => StatusCode::Cancelled,
+            RegionTruncated { .. } => StatusCode::Cancelled,
+            RejectWrite { .. } => StatusCode::StorageUnavailable,
+            CompactRegion { source, .. } => source.status_code(),
+            CompatReader { .. } => StatusCode::Unexpected,
+            InvalidRegionRequest { source, .. } => source.status_code(),
+            RegionReadonly { .. } => StatusCode::RegionReadonly,
+            JsonOptions { .. } => StatusCode::InvalidArguments,
         }
     }
 

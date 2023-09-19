@@ -23,7 +23,7 @@ impl Commands {
     pub fn execute(self, opts: Options) -> Result<(), Error> {
         match (self, opts) {
             (Commands::Standalone(cmd), Options::Standalone(opts)) => {
-                block_on(cmd.execute(opts.fe_opts, opts.dn_opts))
+                block_on(cmd.execute(*opts))
             }
             (Commands::REPL(cmd), Options::Cli(_)) => block_on(cmd.execute()),
             _ => unreachable!(),

@@ -50,7 +50,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unsupported expr in default constraint: {} for column: {}",
+        "Unsupported expr in default constraint: {:?} for column: {}",
         expr,
         column_name
     ))]
@@ -102,6 +102,17 @@ pub enum Error {
         location: Location,
         source: datatypes::error::Error,
     },
+
+    #[snafu(display("Failed to cast SQL value {} to datatype {}", sql_value, datatype))]
+    InvalidCast {
+        sql_value: sqlparser::ast::Value,
+        datatype: ConcreteDataType,
+        location: Location,
+        source: datatypes::error::Error,
+    },
+
+    #[snafu(display("Invalid table option key: {}", key))]
+    InvalidTableOption { key: String, location: Location },
 
     #[snafu(display("Failed to serialize column default constraint, source: {}", source))]
     SerializeColumnDefaultConstraint {
@@ -168,7 +179,9 @@ impl ErrorExt for Error {
             | ColumnTypeMismatch { .. }
             | InvalidTableName { .. }
             | InvalidSqlValue { .. }
-            | TimestampOverflow { .. } => StatusCode::InvalidArguments,
+            | TimestampOverflow { .. }
+            | InvalidTableOption { .. }
+            | InvalidCast { .. } => StatusCode::InvalidArguments,
 
             SerializeColumnDefaultConstraint { source, .. } => source.status_code(),
             ConvertToGrpcDataType { source, .. } => source.status_code(),

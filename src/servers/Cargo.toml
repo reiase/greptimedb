@@ -28,6 +28,7 @@ common-error = { workspace = true }
 common-grpc = { workspace = true }
 common-grpc-expr = { workspace = true }
 common-mem-prof = { workspace = true, optional = true }
+common-meta = { workspace = true }
 common-query = { workspace = true }
 common-recordbatch = { workspace = true }
 common-runtime = { workspace = true }
@@ -44,7 +45,7 @@ headers = "0.3"
 hex = { version = "0.4" }
 hostname = "0.3.1"
 http-body = "0.4"
-humantime-serde = "1.1"
+humantime-serde.workspace = true
 hyper = { version = "0.14", features = ["full"] }
 influxdb_line_protocol = { git = "https://github.com/evenyag/influxdb_iox", branch = "feat/line-protocol" }
 itertools.workspace = true
@@ -82,7 +83,7 @@ sha1 = "0.10"
 snafu.workspace = true
 snap = "1"
 sql = { workspace = true }
-strum = { version = "0.24", features = ["derive"] }
+strum.workspace = true
 table = { workspace = true }
 tokio-rustls = "0.24"
 tokio-stream = { version = "0.1", features = ["net"] }

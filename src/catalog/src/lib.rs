@@ -17,67 +17,28 @@
 #![feature(try_blocks)]
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use api::v1::meta::{RegionStat, TableIdent, TableName};
-use common_telemetry::{info, warn};
-use snafu::ResultExt;
-use table::engine::{EngineContext, TableEngineRef};
+use api::v1::meta::RegionStat;
+use common_telemetry::warn;
+use futures::future::BoxFuture;
 use table::metadata::{TableId, TableType};
 use table::requests::CreateTableRequest;
 use table::TableRef;
 
-use crate::error::{CreateTableSnafu, Result};
+use crate::error::Result;
 
 pub mod error;
 pub mod information_schema;
-pub mod local;
+pub mod kvbackend;
+pub mod memory;
 mod metrics;
-pub mod remote;
-pub mod system;
 pub mod table_source;
-pub mod tables;
 
 #[async_trait::async_trait]
 pub trait CatalogManager: Send + Sync {
     fn as_any(&self) -> &dyn Any;
-
-    /// Starts a catalog manager.
-    async fn start(&self) -> Result<()>;
-
-    /// Registers a catalog to catalog manager, returns whether the catalog exist before.
-    async fn register_catalog(self: Arc<Self>, name: String) -> Result<bool>;
-
-    /// Register a schema with catalog name and schema name. Retuens whether the
-    /// schema registered.
-    ///
-    /// # Errors
-    ///
-    /// This method will/should fail if catalog not exist
-    async fn register_schema(&self, request: RegisterSchemaRequest) -> Result<bool>;
-
-    /// Deregisters a database within given catalog/schema to catalog manager
-    async fn deregister_schema(&self, request: DeregisterSchemaRequest) -> Result<bool>;
-
-    /// Registers a table within given catalog/schema to catalog manager,
-    /// returns whether the table registered.
-    ///
-    /// # Errors
-    ///
-    /// This method will/should fail if catalog or schema not exist
-    async fn register_table(&self, request: RegisterTableRequest) -> Result<bool>;
-
-    /// Deregisters a table within given catalog/schema to catalog manager
-    async fn deregister_table(&self, request: DeregisterTableRequest) -> Result<()>;
-
-    /// Rename a table to [RenameTableRequest::new_table_name], returns whether the table is renamed.
-    async fn rename_table(&self, request: RenameTableRequest) -> Result<bool>;
-
-    /// Register a system table, should be called before starting the manager.
-    async fn register_system_table(&self, request: RegisterSystemTableRequest)
-        -> error::Result<()>;
 
     async fn catalog_names(&self) -> Result<Vec<String>>;
 
@@ -85,11 +46,11 @@ pub trait CatalogManager: Send + Sync {
 
     async fn table_names(&self, catalog: &str, schema: &str) -> Result<Vec<String>>;
 
-    async fn catalog_exist(&self, catalog: &str) -> Result<bool>;
+    async fn catalog_exists(&self, catalog: &str) -> Result<bool>;
 
-    async fn schema_exist(&self, catalog: &str, schema: &str) -> Result<bool>;
+    async fn schema_exists(&self, catalog: &str, schema: &str) -> Result<bool>;
 
-    async fn table_exist(&self, catalog: &str, schema: &str, table: &str) -> Result<bool>;
+    async fn table_exists(&self, catalog: &str, schema: &str, table: &str) -> Result<bool>;
 
     /// Returns the table by catalog, schema and table name.
     async fn table(
@@ -103,7 +64,8 @@ pub trait CatalogManager: Send + Sync {
 pub type CatalogManagerRef = Arc<dyn CatalogManager>;
 
 /// Hook called after system table opening.
-pub type OpenSystemTableHook = Arc<dyn Fn(TableRef) -> Result<()> + Send + Sync>;
+pub type OpenSystemTableHook =
+    Box<dyn Fn(TableRef) -> BoxFuture<'static, Result<()>> + Send + Sync>;
 
 /// Register system table request:
 /// - When system table is already created and registered, the hook will be called
@@ -163,50 +125,6 @@ pub struct RegisterSchemaRequest {
     pub schema: String,
 }
 
-pub(crate) async fn handle_system_table_request<'a, M: CatalogManager>(
-    manager: &'a M,
-    engine: TableEngineRef,
-    sys_table_requests: &'a mut Vec<RegisterSystemTableRequest>,
-) -> Result<()> {
-    for req in sys_table_requests.drain(..) {
-        let catalog_name = &req.create_table_request.catalog_name;
-        let schema_name = &req.create_table_request.schema_name;
-        let table_name = &req.create_table_request.table_name;
-        let table_id = req.create_table_request.id;
-
-        let table = manager.table(catalog_name, schema_name, table_name).await?;
-        let table = if let Some(table) = table {
-            table
-        } else {
-            let table = engine
-                .create_table(&EngineContext::default(), req.create_table_request.clone())
-                .await
-                .with_context(|_| CreateTableSnafu {
-                    table_info: common_catalog::format_full_table_name(
-                        catalog_name,
-                        schema_name,
-                        table_name,
-                    ),
-                })?;
-            let _ = manager
-                .register_table(RegisterTableRequest {
-                    catalog: catalog_name.clone(),
-                    schema: schema_name.clone(),
-                    table_name: table_name.clone(),
-                    table_id,
-                    table: table.clone(),
-                })
-                .await?;
-            info!("Created and registered system table: {table_name}");
-            table
-        };
-        if let Some(hook) = req.open_hook {
-            (hook)(table)?;
-        }
-    }
-    Ok(())
-}
-
 /// The stat of regions in the datanode node.
 /// The number of regions can be got from len of vec.
 ///
@@ -248,23 +166,13 @@ pub async fn datanode_stat(catalog_manager: &CatalogManagerRef) -> (u64, Vec<Reg
                 region_number += region_numbers.len() as u64;
 
                 let engine = &table_info.meta.engine;
-                let table_id = table_info.ident.table_id;
 
                 match table.region_stats() {
                     Ok(stats) => {
                         let stats = stats.into_iter().map(|stat| RegionStat {
                             region_id: stat.region_id,
-                            table_ident: Some(TableIdent {
-                                table_id,
-                                table_name: Some(TableName {
-                                    catalog_name: catalog_name.clone(),
-                                    schema_name: schema_name.clone(),
-                                    table_name: table_name.clone(),
-                                }),
-                                engine: engine.clone(),
-                            }),
                             approximate_bytes: stat.disk_usage_bytes as i64,
-                            attrs: HashMap::from([("engine_name".to_owned(), engine.clone())]),
+                            engine: engine.clone(),
                             ..Default::default()
                         });
 

@@ -12,21 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::Arc;
+use std::time::Duration;
 
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
+use common_telemetry::timer;
 use futures::stream::BoxStream;
 use futures::StreamExt;
+use humantime_serde::re::humantime;
+use metrics::increment_counter;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 
-use crate::error::{self, Error, InvalidTableMetadataSnafu, Result};
+use crate::error::{self, Error, InvalidTableMetadataSnafu, ParseOptionSnafu, Result};
 use crate::key::{TableMetaKey, SCHEMA_NAME_KEY_PATTERN, SCHEMA_NAME_KEY_PREFIX};
 use crate::kv_backend::KvBackendRef;
 use crate::range_stream::{PaginationStream, DEFAULT_PAGE_SIZE};
-use crate::rpc::store::{PutRequest, RangeRequest};
+use crate::rpc::store::RangeRequest;
 use crate::rpc::KeyValue;
+
+const OPT_KEY_TTL: &str = "ttl";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SchemaNameKey<'a> {
@@ -43,8 +50,33 @@ impl<'a> Default for SchemaNameKey<'a> {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SchemaNameValue;
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchemaNameValue {
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub ttl: Option<Duration>,
+}
+
+impl TryFrom<&HashMap<String, String>> for SchemaNameValue {
+    type Error = Error;
+
+    fn try_from(value: &HashMap<String, String>) -> std::result::Result<Self, Self::Error> {
+        let ttl = value
+            .get(OPT_KEY_TTL)
+            .map(|ttl_str| {
+                ttl_str.parse::<humantime::Duration>().map_err(|_| {
+                    ParseOptionSnafu {
+                        key: OPT_KEY_TTL,
+                        value: ttl_str.clone(),
+                    }
+                    .build()
+                })
+            })
+            .transpose()?
+            .map(|ttl| ttl.into());
+        Ok(Self { ttl })
+    }
+}
 
 impl<'a> SchemaNameKey<'a> {
     pub fn new(catalog: &'a str, schema: &'a str) -> Self {
@@ -108,21 +140,39 @@ impl SchemaManager {
     }
 
     /// Creates `SchemaNameKey`.
-    pub async fn create(&self, schema: SchemaNameKey<'_>) -> Result<()> {
-        let raw_key = schema.as_raw_key();
-        let req = PutRequest::new()
-            .with_key(raw_key)
-            .with_value(SchemaNameValue.try_as_raw_value()?);
+    pub async fn create(
+        &self,
+        schema: SchemaNameKey<'_>,
+        value: Option<SchemaNameValue>,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let _timer = timer!(crate::metrics::METRIC_META_CREATE_SCHEMA);
 
-        self.kv_backend.put(req).await?;
+        let raw_key = schema.as_raw_key();
+        let raw_value = value.unwrap_or_default().try_as_raw_value()?;
+        if self
+            .kv_backend
+            .put_conditionally(raw_key, raw_value, if_not_exists)
+            .await?
+        {
+            increment_counter!(crate::metrics::METRIC_META_CREATE_SCHEMA);
+        }
 
         Ok(())
     }
 
-    pub async fn exist(&self, schema: SchemaNameKey<'_>) -> Result<bool> {
+    pub async fn exists(&self, schema: SchemaNameKey<'_>) -> Result<bool> {
         let raw_key = schema.as_raw_key();
 
-        Ok(self.kv_backend.get(&raw_key).await?.is_some())
+        self.kv_backend.exists(&raw_key).await
+    }
+
+    pub async fn get(&self, schema: SchemaNameKey<'_>) -> Result<Option<SchemaNameValue>> {
+        let raw_key = schema.as_raw_key();
+        let value = self.kv_backend.get(&raw_key).await?;
+        value
+            .and_then(|v| SchemaNameValue::try_from_raw_value(v.value.as_ref()).transpose())
+            .transpose()
     }
 
     /// Returns a schema stream, it lists all schemas belong to the target `catalog`.
@@ -143,30 +193,44 @@ impl SchemaManager {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::kv_backend::memory::MemoryKvBackend;
 
     #[test]
     fn test_serialization() {
         let key = SchemaNameKey::new("my-catalog", "my-schema");
-
         assert_eq!(key.to_string(), "__schema_name/my-catalog/my-schema");
 
         let parsed: SchemaNameKey<'_> = "__schema_name/my-catalog/my-schema".try_into().unwrap();
-
         assert_eq!(key, parsed);
+
+        let value = SchemaNameValue {
+            ttl: Some(Duration::from_secs(10)),
+        };
+        let mut opts: HashMap<String, String> = HashMap::new();
+        opts.insert("ttl".to_string(), "10s".to_string());
+        let from_value = SchemaNameValue::try_from(&opts).unwrap();
+        assert_eq!(value, from_value);
+
+        let parsed = SchemaNameValue::try_from_raw_value("{\"ttl\":\"10s\"}".as_bytes()).unwrap();
+        assert_eq!(Some(value), parsed);
+        let none = SchemaNameValue::try_from_raw_value("null".as_bytes()).unwrap();
+        assert!(none.is_none());
+        let err_empty = SchemaNameValue::try_from_raw_value("".as_bytes());
+        assert!(err_empty.is_err());
     }
 
     #[tokio::test]
     async fn test_key_exist() {
         let manager = SchemaManager::new(Arc::new(MemoryKvBackend::default()));
         let schema_key = SchemaNameKey::new("my-catalog", "my-schema");
-        manager.create(schema_key).await.unwrap();
+        manager.create(schema_key, None, false).await.unwrap();
 
-        assert!(manager.exist(schema_key).await.unwrap());
+        assert!(manager.exists(schema_key).await.unwrap());
 
         let wrong_schema_key = SchemaNameKey::new("my-catalog", "my-wrong");
 
-        assert!(!manager.exist(wrong_schema_key).await.unwrap());
+        assert!(!manager.exists(wrong_schema_key).await.unwrap());
     }
 }

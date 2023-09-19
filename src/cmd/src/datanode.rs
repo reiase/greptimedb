@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use common_telemetry::logging;
-use datanode::datanode::{Datanode, DatanodeOptions};
+use datanode::config::DatanodeOptions;
+use datanode::datanode::{Datanode, DatanodeBuilder};
 use meta_client::MetaClientOptions;
 use servers::Mode;
 use snafu::ResultExt;
@@ -91,8 +92,6 @@ struct StartCommand {
     #[clap(long)]
     data_home: Option<String>,
     #[clap(long)]
-    wal_dir: Option<String>,
-    #[clap(long)]
     http_addr: Option<String>,
     #[clap(long)]
     http_timeout: Option<u64>,
@@ -129,7 +128,7 @@ impl StartCommand {
         }
 
         if let Some(metasrv_addrs) = &self.metasrv_addr {
-            opts.meta_client_options
+            opts.meta_client
                 .get_or_insert_with(MetaClientOptions::default)
                 .metasrv_addrs = metasrv_addrs.clone();
             opts.mode = Mode::Distributed;
@@ -146,20 +145,16 @@ impl StartCommand {
             opts.storage.data_home = data_home.clone();
         }
 
-        if let Some(wal_dir) = &self.wal_dir {
-            opts.wal.dir = Some(wal_dir.clone());
-        }
-
         if let Some(http_addr) = &self.http_addr {
-            opts.http_opts.addr = http_addr.clone();
+            opts.http.addr = http_addr.clone();
         }
 
         if let Some(http_timeout) = self.http_timeout {
-            opts.http_opts.timeout = Duration::from_secs(http_timeout)
+            opts.http.timeout = Duration::from_secs(http_timeout)
         }
 
         // Disable dashboard in datanode.
-        opts.http_opts.disable_dashboard = true;
+        opts.http.disable_dashboard = true;
 
         Ok(Options::Datanode(Box::new(opts)))
     }
@@ -168,7 +163,8 @@ impl StartCommand {
         logging::info!("Datanode start command: {:#?}", self);
         logging::info!("Datanode options: {:#?}", opts);
 
-        let datanode = Datanode::new(opts, Default::default())
+        let datanode = DatanodeBuilder::new(opts, None, Default::default())
+            .build()
             .await
             .context(StartDatanodeSnafu)?;
 
@@ -183,9 +179,7 @@ mod tests {
 
     use common_base::readable_size::ReadableSize;
     use common_test_util::temp_dir::create_named_temp_file;
-    use datanode::datanode::{
-        CompactionConfig, FileConfig, ObjectStoreConfig, RegionManifestConfig,
-    };
+    use datanode::config::{CompactionConfig, FileConfig, ObjectStoreConfig, RegionManifestConfig};
     use servers::Mode;
 
     use super::*;
@@ -202,7 +196,7 @@ mod tests {
             rpc_hostname = "127.0.0.1"
             rpc_runtime_size = 8
 
-            [meta_client_options]
+            [meta_client]
             metasrv_addrs = ["127.0.0.1:3002"]
             timeout_millis = 3000
             connect_timeout_millis = 5000
@@ -250,7 +244,6 @@ mod tests {
         assert_eq!("127.0.0.1:3001".to_string(), options.rpc_addr);
         assert_eq!(Some(42), options.node_id);
 
-        assert_eq!("/other/wal", options.wal.dir.unwrap());
         assert_eq!(Duration::from_secs(600), options.wal.purge_interval);
         assert_eq!(1024 * 1024 * 1024, options.wal.file_size.0);
         assert_eq!(1024 * 1024 * 1024 * 50, options.wal.purge_threshold.0);
@@ -262,7 +255,7 @@ mod tests {
             connect_timeout_millis,
             tcp_nodelay,
             ddl_timeout_millis,
-        } = options.meta_client_options.unwrap();
+        } = options.meta_client.unwrap();
 
         assert_eq!(vec!["127.0.0.1:3002".to_string()], metasrv_addr);
         assert_eq!(5000, connect_timeout_millis);
@@ -360,7 +353,7 @@ mod tests {
             rpc_hostname = "127.0.0.1"
             rpc_runtime_size = 8
 
-            [meta_client_options]
+            [meta_client]
             timeout_millis = 3000
             connect_timeout_millis = 5000
             tcp_nodelay = true
@@ -413,10 +406,10 @@ mod tests {
                     Some("99"),
                 ),
                 (
-                    // meta_client_options.metasrv_addrs = 127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003
+                    // meta_client.metasrv_addrs = 127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003
                     [
                         env_prefix.to_string(),
-                        "meta_client_options".to_uppercase(),
+                        "meta_client".to_uppercase(),
                         "metasrv_addrs".to_uppercase(),
                     ]
                     .join(ENV_VAR_SEP),
@@ -426,7 +419,6 @@ mod tests {
             || {
                 let command = StartCommand {
                     config_file: Some(file.path().to_str().unwrap().to_string()),
-                    wal_dir: Some("/other/wal/dir".to_string()),
                     env_prefix: env_prefix.to_string(),
                     ..Default::default()
                 };
@@ -443,7 +435,7 @@ mod tests {
                     Some(Duration::from_secs(9))
                 );
                 assert_eq!(
-                    opts.meta_client_options.unwrap().metasrv_addrs,
+                    opts.meta_client.unwrap().metasrv_addrs,
                     vec![
                         "127.0.0.1:3001".to_string(),
                         "127.0.0.1:3002".to_string(),
@@ -453,9 +445,6 @@ mod tests {
 
                 // Should be read from config file, config file > env > default values.
                 assert_eq!(opts.storage.compaction.max_purge_tasks, 32);
-
-                // Should be read from cli, cli > config file > env > default values.
-                assert_eq!(opts.wal.dir.unwrap(), "/other/wal/dir");
 
                 // Should be default value.
                 assert_eq!(

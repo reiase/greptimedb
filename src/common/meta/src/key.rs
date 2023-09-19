@@ -58,6 +58,7 @@ pub mod table_route;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use datanode_table::{DatanodeTableKey, DatanodeTableManager, DatanodeTableValue};
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -67,12 +68,11 @@ use table::metadata::{RawTableInfo, TableId};
 use table_info::{TableInfoKey, TableInfoManager, TableInfoValue};
 use table_name::{TableNameKey, TableNameManager, TableNameValue};
 
-use self::catalog_name::{CatalogManager, CatalogNameValue};
-use self::schema_name::{SchemaManager, SchemaNameValue};
+use self::catalog_name::{CatalogManager, CatalogNameKey, CatalogNameValue};
+use self::schema_name::{SchemaManager, SchemaNameKey, SchemaNameValue};
 use self::table_route::{TableRouteManager, TableRouteValue};
+use crate::ddl::utils::region_storage_path;
 use crate::error::{self, Result, SerdeJsonSnafu};
-#[allow(deprecated)]
-pub use crate::key::table_route::{TableRouteKey, TABLE_ROUTE_PREFIX};
 use crate::kv_backend::txn::Txn;
 use crate::kv_backend::KvBackendRef;
 use crate::rpc::router::{region_distribution, RegionRoute};
@@ -88,6 +88,7 @@ const TABLE_NAME_KEY_PREFIX: &str = "__table_name";
 const TABLE_REGION_KEY_PREFIX: &str = "__table_region";
 const CATALOG_NAME_KEY_PREFIX: &str = "__catalog_name";
 const SCHEMA_NAME_KEY_PREFIX: &str = "__schema_name";
+const TABLE_ROUTE_PREFIX: &str = "__table_route";
 
 pub type RegionDistribution = BTreeMap<DatanodeId, Vec<RegionNumber>>;
 
@@ -166,6 +167,18 @@ impl TableMetadataManager {
         }
     }
 
+    pub async fn init(&self) -> Result<()> {
+        let catalog_name = CatalogNameKey::new(DEFAULT_CATALOG_NAME);
+        let schema_name = SchemaNameKey::new(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME);
+
+        self.catalog_manager().create(catalog_name, true).await?;
+        self.schema_manager()
+            .create(schema_name, None, true)
+            .await?;
+
+        Ok(())
+    }
+
     pub fn table_name_manager(&self) -> &TableNameManager {
         &self.table_name_manager
     }
@@ -188,6 +201,11 @@ impl TableMetadataManager {
 
     pub fn table_route_manager(&self) -> &TableRouteManager {
         &self.table_route_manager
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn kv_backend(&self) -> &KvBackendRef {
+        &self.kv_backend
     }
 
     pub async fn get_full_table_info(
@@ -224,6 +242,9 @@ impl TableMetadataManager {
             .collect::<Vec<_>>();
         table_info.meta.region_numbers = region_numbers;
         let table_id = table_info.ident.table_id;
+        let engine = table_info.meta.engine.clone();
+        let region_storage_path =
+            region_storage_path(&table_info.catalog_name, &table_info.schema_name);
 
         // Creates table name.
         let table_name = TableNameKey::new(
@@ -243,9 +264,12 @@ impl TableMetadataManager {
 
         // Creates datanode table key value pairs.
         let distribution = region_distribution(&region_routes)?;
-        let create_datanode_table_txn = self
-            .datanode_table_manager()
-            .build_create_txn(table_id, distribution)?;
+        let create_datanode_table_txn = self.datanode_table_manager().build_create_txn(
+            table_id,
+            &engine,
+            &region_storage_path,
+            distribution,
+        )?;
 
         // Creates table route.
         let table_route_value = TableRouteValue::new(region_routes);
@@ -422,6 +446,8 @@ impl TableMetadataManager {
     pub async fn update_table_route(
         &self,
         table_id: TableId,
+        engine: &str,
+        region_storage_path: &str,
         current_table_route_value: TableRouteValue,
         new_region_routes: Vec<RegionRoute>,
     ) -> Result<()> {
@@ -432,6 +458,8 @@ impl TableMetadataManager {
 
         let update_datanode_table_txn = self.datanode_table_manager().build_update_txn(
             table_id,
+            engine,
+            region_storage_path,
             current_region_distribution,
             new_region_distribution,
         )?;
@@ -494,13 +522,33 @@ macro_rules! impl_table_meta_value {
     }
 }
 
+#[macro_export]
+macro_rules! impl_optional_meta_value {
+    ($($val_ty: ty), *) => {
+        $(
+            impl $val_ty {
+                pub fn try_from_raw_value(raw_value: &[u8]) -> Result<Option<Self>> {
+                    serde_json::from_slice(raw_value).context(SerdeJsonSnafu)
+                }
+
+                pub fn try_as_raw_value(&self) -> Result<Vec<u8>> {
+                    serde_json::to_vec(self).context(SerdeJsonSnafu)
+                }
+            }
+        )*
+    }
+}
+
 impl_table_meta_value! {
-    CatalogNameValue,
-    SchemaNameValue,
     TableNameValue,
     TableInfoValue,
     DatanodeTableValue,
     TableRouteValue
+}
+
+impl_optional_meta_value! {
+    CatalogNameValue,
+    SchemaNameValue
 }
 
 #[cfg(test)]
@@ -514,6 +562,7 @@ mod tests {
     use table::metadata::{RawTableInfo, TableInfo, TableInfoBuilder, TableMetaBuilder};
 
     use super::datanode_table::DatanodeTableKey;
+    use crate::ddl::utils::region_storage_path;
     use crate::key::table_info::TableInfoValue;
     use crate::key::table_name::TableNameKey;
     use crate::key::table_route::TableRouteValue;
@@ -826,6 +875,9 @@ mod tests {
         let table_info: RawTableInfo =
             new_test_table_info(region_routes.iter().map(|r| r.region.id.region_number())).into();
         let table_id = table_info.ident.table_id;
+        let engine = table_info.meta.engine.as_str();
+        let region_storage_path =
+            region_storage_path(&table_info.catalog_name, &table_info.schema_name);
         let current_table_route_value = TableRouteValue::new(region_routes.clone());
         // creates metadata.
         table_metadata_manager
@@ -842,6 +894,8 @@ mod tests {
         table_metadata_manager
             .update_table_route(
                 table_id,
+                engine,
+                &region_storage_path,
                 current_table_route_value.clone(),
                 new_region_routes.clone(),
             )
@@ -853,6 +907,8 @@ mod tests {
         table_metadata_manager
             .update_table_route(
                 table_id,
+                engine,
+                &region_storage_path,
                 current_table_route_value.clone(),
                 new_region_routes.clone(),
             )
@@ -865,6 +921,8 @@ mod tests {
         table_metadata_manager
             .update_table_route(
                 table_id,
+                engine,
+                &region_storage_path,
                 current_table_route_value.clone(),
                 new_region_routes.clone(),
             )
@@ -881,7 +939,13 @@ mod tests {
             new_region_route(4, 4),
         ]);
         assert!(table_metadata_manager
-            .update_table_route(table_id, wrong_table_route_value, new_region_routes)
+            .update_table_route(
+                table_id,
+                engine,
+                &region_storage_path,
+                wrong_table_route_value,
+                new_region_routes
+            )
             .await
             .is_err());
     }

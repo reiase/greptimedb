@@ -15,17 +15,32 @@
 #![feature(assert_matches)]
 #![feature(trait_upcasting)]
 
+use query::query_engine::SqlStatementExecutor;
+
+pub mod alive_keeper;
+pub mod config;
 pub mod datanode;
 pub mod error;
+pub mod event_listener;
 pub mod heartbeat;
-pub mod instance;
 pub mod metrics;
-#[cfg(any(test, feature = "testing"))]
-mod mock;
 pub mod region_server;
-mod row_inserter;
 pub mod server;
-pub mod sql;
 mod store;
 #[cfg(test)]
+#[allow(dead_code)]
 mod tests;
+
+// TODO(ruihang): remove this
+pub struct Instance;
+
+#[async_trait::async_trait]
+impl SqlStatementExecutor for Instance {
+    async fn execute_sql(
+        &self,
+        _stmt: sql::statements::statement::Statement,
+        _query_ctx: session::context::QueryContextRef,
+    ) -> query::error::Result<common_query::Output> {
+        unreachable!()
+    }
+}

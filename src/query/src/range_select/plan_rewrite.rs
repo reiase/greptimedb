@@ -325,8 +325,8 @@ fn have_range_in_exprs(exprs: &Vec<Expr>) -> bool {
 #[cfg(test)]
 mod test {
 
-    use catalog::local::MemoryCatalogManager;
-    use catalog::{CatalogManager, RegisterTableRequest};
+    use catalog::memory::MemoryCatalogManager;
+    use catalog::RegisterTableRequest;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
     use datatypes::prelude::ConcreteDataType;
     use datatypes::schema::{ColumnSchema, Schema};
@@ -377,19 +377,18 @@ mod test {
             .meta(table_meta)
             .build()
             .unwrap();
-        let table = Arc::new(EmptyTable::from_table_info(&table_info));
+        let table = EmptyTable::from_table_info(&table_info);
         let catalog_list = MemoryCatalogManager::with_default_setup();
         assert!(catalog_list
-            .register_table(RegisterTableRequest {
+            .register_table_sync(RegisterTableRequest {
                 catalog: DEFAULT_CATALOG_NAME.to_string(),
                 schema: DEFAULT_SCHEMA_NAME.to_string(),
                 table_name,
                 table_id: 1024,
                 table,
             })
-            .await
             .is_ok());
-        QueryEngineFactory::new(catalog_list, false).query_engine()
+        QueryEngineFactory::new(catalog_list, None, false).query_engine()
     }
 
     async fn query_plan_compare(sql: &str, expected: String) {

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use api::v1::greptime_request::Request;
 use api::v1::query_request::Query;
 use async_trait::async_trait;
-use catalog::local::MemoryCatalogManager;
+use catalog::memory::MemoryCatalogManager;
 use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_query::Output;
 use query::parser::{PromQuery, QueryLanguageParser, QueryStatement};
@@ -30,7 +30,7 @@ use servers::query_handler::sql::{ServerSqlQueryHandlerRef, SqlQueryHandler};
 use session::context::QueryContextRef;
 use snafu::ensure;
 use sql::statements::statement::Statement;
-use table::test_util::MemTable;
+use table::TableRef;
 
 mod grpc;
 mod http;
@@ -158,10 +158,9 @@ impl GrpcQueryHandler for DummyInstance {
     }
 }
 
-fn create_testing_instance(table: MemTable) -> DummyInstance {
-    let table = Arc::new(table);
+fn create_testing_instance(table: TableRef) -> DummyInstance {
     let catalog_manager = MemoryCatalogManager::new_with_table(table);
-    let query_engine = QueryEngineFactory::new(catalog_manager, false).query_engine();
+    let query_engine = QueryEngineFactory::new(catalog_manager, None, false).query_engine();
     DummyInstance::new(query_engine)
 }
 
@@ -169,6 +168,6 @@ fn create_testing_sql_query_handler(table: MemTable) -> ServerSqlQueryHandlerRef
     Arc::new(create_testing_instance(table)) as _
 }
 
-fn create_testing_grpc_query_handler(table: MemTable) -> ServerGrpcQueryHandlerRef {
+fn create_testing_grpc_query_handler(table: TableRef) -> ServerGrpcQueryHandlerRef {
     Arc::new(create_testing_instance(table)) as _
 }
