@@ -17,12 +17,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use api::v1::meta::HeartbeatResponse;
-use catalog::remote::KvCacheInvalidator;
+use catalog::kvbackend::KvCacheInvalidator;
 use common_meta::heartbeat::handler::{
     HandlerGroupExecutor, HeartbeatResponseHandlerContext, HeartbeatResponseHandlerExecutor,
 };
 use common_meta::heartbeat::mailbox::{HeartbeatMailbox, MessageMeta};
-use common_meta::ident::TableIdent;
 use common_meta::instruction::{Instruction, InstructionReply, SimpleReply};
 use common_meta::key::table_info::TableInfoKey;
 use common_meta::key::TableMetaKey;
@@ -64,13 +63,8 @@ async fn test_invalidate_table_cache_handler() {
         inner: Mutex::new(inner),
     });
 
-    let inner = HashMap::from([(table_id, 1)]);
-    let table_route = Arc::new(MockTableRouteCacheInvalidator {
-        inner: Mutex::new(inner),
-    });
-
     let executor = Arc::new(HandlerGroupExecutor::new(vec![Arc::new(
-        InvalidateTableCacheHandler::new(backend.clone(), table_route.clone()),
+        InvalidateTableCacheHandler::new(backend.clone()),
     )]));
 
     let (tx, mut rx) = mpsc::channel(8);
@@ -80,13 +74,7 @@ async fn test_invalidate_table_cache_handler() {
     handle_instruction(
         executor.clone(),
         mailbox.clone(),
-        Instruction::InvalidateTableCache(TableIdent {
-            catalog: "test".to_string(),
-            schema: "greptime".to_string(),
-            table: "foo_table".to_string(),
-            table_id,
-            engine: "mito".to_string(),
-        }),
+        Instruction::InvalidateTableIdCache(table_id),
     )
     .await;
 
@@ -101,21 +89,8 @@ async fn test_invalidate_table_cache_handler() {
         .unwrap()
         .contains_key(&table_info_key.as_raw_key()));
 
-    assert!(!table_route.inner.lock().unwrap().contains_key(&table_id));
-
     // removes a invalid key
-    handle_instruction(
-        executor,
-        mailbox,
-        Instruction::InvalidateTableCache(TableIdent {
-            catalog: "test".to_string(),
-            schema: "greptime".to_string(),
-            table: "not_found".to_string(),
-            table_id: 0,
-            engine: "mito".to_string(),
-        }),
-    )
-    .await;
+    handle_instruction(executor, mailbox, Instruction::InvalidateTableIdCache(0)).await;
 
     let (_, reply) = rx.recv().await.unwrap();
     assert_matches!(

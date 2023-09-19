@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod admin;
 pub mod authorize;
 pub mod handler;
 pub mod header;
@@ -63,7 +62,6 @@ use self::authorize::HttpAuth;
 use self::influxdb::{influxdb_health, influxdb_ping, influxdb_write_v1, influxdb_write_v2};
 use crate::configurator::ConfiguratorRef;
 use crate::error::{AlreadyStartedSnafu, Result, StartHttpSnafu};
-use crate::http::admin::{compact, flush};
 use crate::http::prometheus::{
     instant_query, label_values_query, labels_query, range_query, series_query,
 };
@@ -469,13 +467,6 @@ impl HttpServer {
             router = router.nest(&format!("/{HTTP_API_VERSION}"), sql_router);
         }
 
-        if let Some(grpc_handler) = self.grpc_handler.clone() {
-            router = router.nest(
-                &format!("/{HTTP_API_VERSION}/admin"),
-                self.route_admin(grpc_handler.clone()),
-            );
-        }
-
         if let Some(opentsdb_handler) = self.opentsdb_handler.clone() {
             router = router.nest(
                 &format!("/{HTTP_API_VERSION}/opentsdb"),
@@ -639,13 +630,6 @@ impl HttpServer {
         Router::new()
             .route("/api/put", routing::post(opentsdb::put))
             .with_state(opentsdb_handler)
-    }
-
-    fn route_admin<S>(&self, grpc_handler: ServerGrpcQueryHandlerRef) -> Router<S> {
-        Router::new()
-            .route("/flush", routing::post(flush))
-            .route("/compact", routing::post(compact))
-            .with_state(grpc_handler)
     }
 
     fn route_config<S>(&self, state: GreptimeOptionsConfigState) -> ApiRouter<S> {

@@ -20,9 +20,8 @@ use common_error::status_code::StatusCode;
 use datafusion::error::DataFusionError;
 use datatypes::prelude::ConcreteDataType;
 use snafu::{Location, Snafu};
+use table::metadata::TableId;
 use tokio::task::JoinError;
-
-use crate::DeregisterTableRequest;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -142,9 +141,9 @@ pub enum Error {
     #[snafu(display("Operation {} not supported", op))]
     NotSupported { op: String, location: Location },
 
-    #[snafu(display("Failed to open table, table info: {}, source: {}", table_info, source))]
+    #[snafu(display("Failed to open table {table_id}, source: {source}, at {location}"))]
     OpenTable {
-        table_info: String,
+        table_id: TableId,
         location: Location,
         source: table::error::Error,
     },
@@ -178,20 +177,6 @@ pub enum Error {
         location: Location,
         source: table::error::Error,
     },
-
-    #[snafu(display(
-        "Failed to deregister table, request: {:?}, source: {}",
-        request,
-        source
-    ))]
-    DeregisterTable {
-        request: DeregisterTableRequest,
-        location: Location,
-        source: table::error::Error,
-    },
-
-    #[snafu(display("Illegal catalog manager state: {}", msg))]
-    IllegalManagerState { location: Location, msg: String },
 
     #[snafu(display("Failed to scan system catalog table, source: {}", source))]
     SystemCatalogTableScan {
@@ -238,9 +223,6 @@ pub enum Error {
     #[snafu(display("Illegal access to catalog: {} and schema: {}", catalog, schema))]
     QueryAccessDenied { catalog: String, schema: String },
 
-    #[snafu(display("Invalid system table definition: {err_msg}"))]
-    InvalidSystemTableDef { err_msg: String, location: Location },
-
     #[snafu(display("{}: {}", msg, source))]
     Datafusion {
         msg: String,
@@ -272,10 +254,8 @@ impl ErrorExt for Error {
             Error::InvalidKey { .. }
             | Error::SchemaNotFound { .. }
             | Error::TableNotFound { .. }
-            | Error::IllegalManagerState { .. }
             | Error::CatalogNotFound { .. }
             | Error::InvalidEntryType { .. }
-            | Error::InvalidSystemTableDef { .. }
             | Error::ParallelOpenTable { .. } => StatusCode::Unexpected,
 
             Error::SystemCatalog { .. }
@@ -306,7 +286,6 @@ impl ErrorExt for Error {
             | Error::InsertCatalogRecord { source, .. }
             | Error::OpenTable { source, .. }
             | Error::CreateTable { source, .. }
-            | Error::DeregisterTable { source, .. }
             | Error::TableSchemaMismatch { source, .. } => source.status_code(),
 
             Error::MetaSrv { source, .. } => source.status_code(),

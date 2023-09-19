@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
-use common_catalog::consts::IMMUTABLE_FILE_ENGINE;
+use common_catalog::consts::FILE_ENGINE;
 use itertools::Itertools;
+use sqlparser_derive::{Visit, VisitMut};
 
 use crate::ast::{ColumnDef, Ident, ObjectName, SqlOption, TableConstraint, Value as SqlValue};
+use crate::statements::OptionMap;
 
 const LINE_SEP: &str = ",\n";
 const COMMA_SEP: &str = ", ";
@@ -57,7 +58,7 @@ pub fn is_time_index(constraint: &TableConstraint) -> bool {
     }  if name.value == TIME_INDEX)
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
 pub struct CreateTable {
     /// Create if not exists
     pub if_not_exists: bool,
@@ -124,7 +125,7 @@ impl CreateTable {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
 pub struct Partitions {
     pub column_list: Vec<Ident>,
     pub entries: Vec<PartitionEntry>,
@@ -139,7 +140,7 @@ impl Partitions {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
 pub struct PartitionEntry {
     pub name: Ident,
     pub value_list: Vec<SqlValue>,
@@ -161,9 +162,7 @@ impl Display for Partitions {
         if !self.column_list.is_empty() {
             write!(
                 f,
-                r#"PARTITION BY RANGE COLUMNS ({}) (
-                    {}
-                )"#,
+                "PARTITION BY RANGE COLUMNS ({}) (\n{}\n)",
                 format_list_comma!(self.column_list),
                 format_list_indent!(self.entries),
             )
@@ -182,7 +181,7 @@ impl Display for CreateTable {
         let partitions = self.format_partitions();
         let engine = &self.engine;
         let options = self.format_options();
-        let maybe_external = if self.engine == IMMUTABLE_FILE_ENGINE {
+        let maybe_external = if self.engine == FILE_ENGINE {
             "EXTERNAL "
         } else {
             ""
@@ -199,14 +198,14 @@ impl Display for CreateTable {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
 pub struct CreateDatabase {
     pub name: ObjectName,
     /// Create if not exists
     pub if_not_exists: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Visit, VisitMut)]
 pub struct CreateExternalTable {
     /// Table name
     pub name: ObjectName,
@@ -214,7 +213,7 @@ pub struct CreateExternalTable {
     pub constraints: Vec<TableConstraint>,
     /// Table options in `WITH`.
     /// All keys are lowercase.
-    pub options: HashMap<String, String>,
+    pub options: OptionMap,
     pub if_not_exists: bool,
     pub engine: String,
 }
@@ -222,6 +221,7 @@ pub struct CreateExternalTable {
 #[cfg(test)]
 mod tests {
     use crate::dialect::GreptimeDbDialect;
+    use crate::error::Error::InvalidTableOption;
     use crate::parser::ParserContext;
     use crate::statements::statement::Statement;
 
@@ -229,7 +229,7 @@ mod tests {
     fn test_display_create_table() {
         let sql = r"create table if not exists demo(
                              host string,
-                             ts bigint,
+                             ts timestamp,
                              cpu double default 0,
                              memory double,
                              TIME INDEX (ts),
@@ -253,17 +253,17 @@ mod tests {
                     r#"
 CREATE TABLE IF NOT EXISTS demo (
   host STRING,
-  ts BIGINT,
+  ts TIMESTAMP,
   cpu DOUBLE DEFAULT 0,
   memory DOUBLE,
   TIME INDEX (ts),
   PRIMARY KEY (ts, host)
 )
 PARTITION BY RANGE COLUMNS (ts) (
-                      PARTITION r0 VALUES LESS THAN (5),
+  PARTITION r0 VALUES LESS THAN (5),
   PARTITION r1 VALUES LESS THAN (9),
   PARTITION r2 VALUES LESS THAN (MAXVALUE)
-                )
+)
 ENGINE=mito
 WITH(
   regions = 1,
@@ -284,7 +284,7 @@ WITH(
     fn test_display_empty_partition_column() {
         let sql = r"create table if not exists demo(
             host string,
-            ts bigint,
+            ts timestamp,
             cpu double default 0,
             memory double,
             TIME INDEX (ts),
@@ -301,7 +301,7 @@ WITH(
                     r#"
 CREATE TABLE IF NOT EXISTS demo (
   host STRING,
-  ts BIGINT,
+  ts TIMESTAMP,
   cpu DOUBLE DEFAULT 0,
   memory DOUBLE,
   TIME INDEX (ts),
@@ -318,5 +318,27 @@ ENGINE=mito
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn test_validate_table_options() {
+        let sql = r"create table if not exists demo(
+            host string,
+            ts bigint,
+            cpu double default 0,
+            memory double,
+            TIME INDEX (ts),
+            PRIMARY KEY(ts, host)
+      )
+      PARTITION BY RANGE COLUMNS (ts) (
+        PARTITION r0 VALUES LESS THAN (5),
+        PARTITION r1 VALUES LESS THAN (9),
+        PARTITION r2 VALUES LESS THAN (MAXVALUE),
+      )
+      engine=mito
+      with(regions=1, ttl='7d', hello='world');
+";
+        let result = ParserContext::create_with_dialect(sql, &GreptimeDbDialect {});
+        assert!(matches!(result, Err(InvalidTableOption { .. })))
     }
 }

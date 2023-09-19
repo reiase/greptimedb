@@ -16,40 +16,70 @@ use std::time::Duration;
 
 use api::v1::meta::MailboxMessage;
 use async_trait::async_trait;
-use common_meta::instruction::{Instruction, InstructionReply, SimpleReply};
+use common_meta::ddl::utils::region_storage_path;
+use common_meta::instruction::{Instruction, InstructionReply, OpenRegion, SimpleReply};
 use common_meta::peer::Peer;
 use common_meta::RegionIdent;
-use common_telemetry::debug;
+use common_telemetry::{debug, info};
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 
 use super::update_metadata::UpdateRegionMetadata;
 use super::{RegionFailoverContext, State};
 use crate::error::{
-    Error, Result, RetryLaterSnafu, SerializeToJsonSnafu, UnexpectedInstructionReplySnafu,
+    self, Error, Result, RetryLaterSnafu, SerializeToJsonSnafu, UnexpectedInstructionReplySnafu,
 };
 use crate::handler::HeartbeatMailbox;
-use crate::inactive_node_manager::InactiveNodeManager;
+use crate::inactive_region_manager::InactiveRegionManager;
 use crate::procedure::region_failover::OPEN_REGION_MESSAGE_TIMEOUT;
 use crate::service::mailbox::{Channel, MailboxReceiver};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub(super) struct ActivateRegion {
     candidate: Peer,
+    region_storage_path: Option<String>,
 }
 
 impl ActivateRegion {
     pub(super) fn new(candidate: Peer) -> Self {
-        Self { candidate }
+        Self {
+            candidate,
+            region_storage_path: None,
+        }
     }
 
     async fn send_open_region_message(
-        &self,
+        &mut self,
         ctx: &RegionFailoverContext,
         failed_region: &RegionIdent,
         timeout: Duration,
     ) -> Result<MailboxReceiver> {
-        let instruction = Instruction::OpenRegion(failed_region.clone());
+        let table_id = failed_region.table_id;
+        // TODO(weny): considers fetching table info only once.
+        let table_info = ctx
+            .table_metadata_manager
+            .table_info_manager()
+            .get(table_id)
+            .await
+            .context(error::TableMetadataManagerSnafu)?
+            .context(error::TableInfoNotFoundSnafu { table_id })?
+            .table_info;
+
+        let region_storage_path =
+            region_storage_path(&table_info.catalog_name, &table_info.schema_name);
+
+        let candidate_ident = RegionIdent {
+            datanode_id: self.candidate.id,
+            ..failed_region.clone()
+        };
+        info!("Activating region: {candidate_ident:?}");
+
+        let instruction = Instruction::OpenRegion(OpenRegion::new(
+            candidate_ident.clone(),
+            &region_storage_path,
+        ));
+
+        self.region_storage_path = Some(region_storage_path);
 
         let msg = MailboxMessage::json_message(
             "Activate Region",
@@ -72,12 +102,8 @@ impl ActivateRegion {
         // command in time, it was considered an inactive node by metasrv, then it replied, and the
         // current region failed over again, and the node was selected as a candidate, so it needs
         // to clear its previous state first.
-        let candidate = RegionIdent {
-            datanode_id: self.candidate.id,
-            ..failed_region.clone()
-        };
-        InactiveNodeManager::new(&ctx.in_memory)
-            .deregister_inactive_region(&candidate)
+        InactiveRegionManager::new(&ctx.in_memory)
+            .deregister_inactive_region(&candidate_ident)
             .await?;
 
         let ch = Channel::Datanode(self.candidate.id);
@@ -85,7 +111,7 @@ impl ActivateRegion {
     }
 
     async fn handle_response(
-        self,
+        &mut self,
         mailbox_receiver: MailboxReceiver,
         failed_region: &RegionIdent,
     ) -> Result<Box<dyn State>> {
@@ -102,7 +128,14 @@ impl ActivateRegion {
                     .fail();
                 };
                 if result {
-                    Ok(Box::new(UpdateRegionMetadata::new(self.candidate)))
+                    Ok(Box::new(UpdateRegionMetadata::new(
+                        self.candidate.clone(),
+                        self.region_storage_path
+                            .clone()
+                            .context(error::UnexpectedSnafu {
+                                violated: "expected region_storage_path",
+                            })?,
+                    )))
                 } else {
                     // The region could be just indeed cannot be opened by the candidate, retry
                     // would be in vain. Then why not just end the failover procedure? Because we
@@ -131,7 +164,7 @@ impl ActivateRegion {
 #[typetag::serde]
 impl State for ActivateRegion {
     async fn next(
-        mut self: Box<Self>,
+        &mut self,
         ctx: &RegionFailoverContext,
         failed_region: &RegionIdent,
     ) -> Result<Box<dyn State>> {
@@ -159,7 +192,7 @@ mod tests {
         let failed_region = env.failed_region(1).await;
 
         let candidate = 2;
-        let state = ActivateRegion::new(Peer::new(candidate, ""));
+        let mut state = ActivateRegion::new(Peer::new(candidate, ""));
         let mailbox_receiver = state
             .send_open_region_message(&env.context, &failed_region, Duration::from_millis(100))
             .await
@@ -178,7 +211,14 @@ mod tests {
         assert_eq!(
             received.payload,
             Some(Payload::Json(
-                serde_json::to_string(&Instruction::OpenRegion(failed_region.clone())).unwrap(),
+                serde_json::to_string(&Instruction::OpenRegion(OpenRegion::new(
+                    RegionIdent {
+                        datanode_id: candidate,
+                        ..failed_region.clone()
+                    },
+                    &env.path
+                )))
+                .unwrap(),
             ))
         );
 
@@ -211,7 +251,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             format!("{next_state:?}"),
-            r#"UpdateRegionMetadata { candidate: Peer { id: 2, addr: "" } }"#
+            r#"UpdateRegionMetadata { candidate: Peer { id: 2, addr: "" }, region_storage_path: "greptime/public" }"#
         );
     }
 
@@ -223,7 +263,7 @@ mod tests {
         let failed_region = env.failed_region(1).await;
 
         let candidate = 2;
-        let state = ActivateRegion::new(Peer::new(candidate, ""));
+        let mut state = ActivateRegion::new(Peer::new(candidate, ""));
         let mailbox_receiver = state
             .send_open_region_message(&env.context, &failed_region, Duration::from_millis(100))
             .await
@@ -240,7 +280,14 @@ mod tests {
         assert_eq!(
             received.payload,
             Some(Payload::Json(
-                serde_json::to_string(&Instruction::OpenRegion(failed_region.clone())).unwrap()
+                serde_json::to_string(&Instruction::OpenRegion(OpenRegion::new(
+                    RegionIdent {
+                        datanode_id: candidate,
+                        ..failed_region.clone()
+                    },
+                    &env.path
+                )))
+                .unwrap(),
             ))
         );
 

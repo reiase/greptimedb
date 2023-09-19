@@ -56,6 +56,9 @@ pub enum StatusCode {
     TableColumnNotFound = 4002,
     TableColumnExists = 4003,
     DatabaseNotFound = 4004,
+    RegionNotFound = 4005,
+    RegionAlreadyExists = 4006,
+    RegionReadonly = 4007,
     // ====== End of catalog related status code =======
 
     // ====== Begin of storage related status code =====
@@ -113,6 +116,9 @@ impl StatusCode {
             | StatusCode::EngineExecuteQuery
             | StatusCode::TableAlreadyExists
             | StatusCode::TableNotFound
+            | StatusCode::RegionNotFound
+            | StatusCode::RegionAlreadyExists
+            | StatusCode::RegionReadonly
             | StatusCode::TableColumnNotFound
             | StatusCode::TableColumnExists
             | StatusCode::DatabaseNotFound
@@ -145,6 +151,9 @@ impl StatusCode {
             | StatusCode::InvalidSyntax
             | StatusCode::TableAlreadyExists
             | StatusCode::TableNotFound
+            | StatusCode::RegionNotFound
+            | StatusCode::RegionAlreadyExists
+            | StatusCode::RegionReadonly
             | StatusCode::TableColumnNotFound
             | StatusCode::TableColumnExists
             | StatusCode::DatabaseNotFound
@@ -173,6 +182,11 @@ impl StatusCode {
             v if v == StatusCode::EngineExecuteQuery as u32 => Some(StatusCode::EngineExecuteQuery),
             v if v == StatusCode::TableAlreadyExists as u32 => Some(StatusCode::TableAlreadyExists),
             v if v == StatusCode::TableNotFound as u32 => Some(StatusCode::TableNotFound),
+            v if v == StatusCode::RegionNotFound as u32 => Some(StatusCode::RegionNotFound),
+            v if v == StatusCode::RegionAlreadyExists as u32 => {
+                Some(StatusCode::RegionAlreadyExists)
+            }
+            v if v == StatusCode::RegionReadonly as u32 => Some(StatusCode::RegionReadonly),
             v if v == StatusCode::TableColumnNotFound as u32 => {
                 Some(StatusCode::TableColumnNotFound)
             }

@@ -17,7 +17,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use common_function::scalars::aggregate::AggregateFunctionMeta;
-use common_function_macro::{as_aggr_func_creator, AggrFuncTypeStore};
+use common_macro::{as_aggr_func_creator, AggrFuncTypeStore};
 use common_query::error::{CreateAccumulatorSnafu, Result as QueryResult};
 use common_query::logical_plan::{Accumulator, AggregateFunctionCreator};
 use common_query::prelude::*;
@@ -202,7 +202,7 @@ where
     let schema = Arc::new(Schema::new(column_schemas.clone()));
     let column: VectorRef = Arc::new(T::VectorType::from_vec(numbers));
     let recordbatch = RecordBatch::new(schema, vec![column]).unwrap();
-    let testing_table = MemTable::new(&table_name, recordbatch);
+    let testing_table = MemTable::table(&table_name, recordbatch);
 
     let engine = new_query_engine_with_table(testing_table);
 

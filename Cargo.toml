@@ -8,10 +8,11 @@ members = [
     "src/cmd",
     "src/common/base",
     "src/common/catalog",
+    "src/common/config",
     "src/common/datasource",
     "src/common/error",
     "src/common/function",
-    "src/common/function-macro",
+    "src/common/macro",
     "src/common/grpc",
     "src/common/grpc-expr",
     "src/common/mem-prof",
@@ -28,14 +29,14 @@ members = [
     "src/common/version",
     "src/datanode",
     "src/datatypes",
-    "src/file-table-engine",
+    "src/file-engine",
     "src/frontend",
     "src/log-store",
     "src/meta-client",
     "src/meta-srv",
-    "src/mito",
     "src/mito2",
     "src/object-store",
+    "src/operator",
     "src/partition",
     "src/promql",
     "src/query",
@@ -45,8 +46,8 @@ members = [
     "src/storage",
     "src/store-api",
     "src/table",
-    "src/table-procedure",
-    "tests-integration",
+    # TODO: add this back once the region server is available
+    # "tests-integration",
     "tests/runner",
 ]
 resolver = "2"
@@ -57,6 +58,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+aquamarine = "0.3"
 arrow = { version = "43.0" }
 etcd-client = "0.11"
 arrow-array = "43.0"
@@ -75,7 +77,8 @@ datafusion-substrait = { git = "https://github.com/waynexia/arrow-datafusion.git
 derive_builder = "0.12"
 futures = "0.3"
 futures-util = "0.3"
-greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "3489b4742150abe0a769faf1bb60fbb95b061fc8" }
+greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "9d3f28d07d29607d0e3c1823f4a4d2bc229d05b9" }
+humantime-serde = "1.1"
 itertools = "0.10"
 lazy_static = "1.4"
 once_cell = "1.18"
@@ -84,12 +87,19 @@ paste = "1.0"
 prost = "0.11"
 rand = "0.8"
 regex = "1.8"
+reqwest = { version = "0.11", default-features = false, features = [
+    "json",
+    "rustls-tls-native-roots",
+    "stream",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+smallvec = "1"
 snafu = { version = "0.7", features = ["backtraces"] }
 sqlparser = { git = "https://github.com/GreptimeTeam/sqlparser-rs.git", rev = "296a4f6c73b129d6f565a42a2e5e53c6bc2b9da4", features = [
     "visitor",
 ] }
+strum = { version = "0.25", features = ["derive"] }
 tempfile = "3"
 tokio = { version = "1.28", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io-util", "compat"] }
@@ -106,10 +116,11 @@ client = { path = "src/client" }
 cmd = { path = "src/cmd" }
 common-base = { path = "src/common/base" }
 common-catalog = { path = "src/common/catalog" }
+common-config = { path = "src/common/config" }
 common-datasource = { path = "src/common/datasource" }
 common-error = { path = "src/common/error" }
 common-function = { path = "src/common/function" }
-common-function-macro = { path = "src/common/function-macro" }
+common-macro = { path = "src/common/macro" }
 common-grpc = { path = "src/common/grpc" }
 common-grpc-expr = { path = "src/common/grpc-expr" }
 common-mem-prof = { path = "src/common/mem-prof" }
@@ -127,17 +138,19 @@ common-time = { path = "src/common/time" }
 common-version = { path = "src/common/version" }
 datanode = { path = "src/datanode" }
 datatypes = { path = "src/datatypes" }
-file-table-engine = { path = "src/file-table-engine" }
+file-engine = { path = "src/file-engine" }
 frontend = { path = "src/frontend" }
 log-store = { path = "src/log-store" }
 meta-client = { path = "src/meta-client" }
 meta-srv = { path = "src/meta-srv" }
 mito = { path = "src/mito" }
 mito2 = { path = "src/mito2" }
+operator = { path = "src/operator" }
 object-store = { path = "src/object-store" }
 partition = { path = "src/partition" }
 promql = { path = "src/promql" }
 query = { path = "src/query" }
+raft-engine = { git = "https://github.com/tikv/raft-engine.git", rev = "22dfb426cd994602b57725ef080287d3e53db479" }
 servers = { path = "src/servers" }
 session = { path = "src/session" }
 sql = { path = "src/sql" }

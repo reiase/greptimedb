@@ -12,24 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-
 use api::v1::meta::{HeartbeatRequest, RegionLease, Role};
 use async_trait::async_trait;
-use store_api::storage::RegionId;
 
 use crate::error::Result;
 use crate::handler::{HeartbeatAccumulator, HeartbeatHandler};
-use crate::inactive_node_manager::InactiveNodeManager;
+use crate::inactive_region_manager::InactiveRegionManager;
 use crate::metasrv::Context;
 
-/// The lease seconds of a region. It's set by two default heartbeat intervals (5 second × 2) plus
-/// two roundtrip time (2 second × 2 × 2), plus some extra buffer (2 second).
-// TODO(LFC): Make region lease seconds calculated from Datanode heartbeat configuration.
-pub(crate) const REGION_LEASE_SECONDS: u64 = 20;
+pub struct RegionLeaseHandler {
+    region_lease_seconds: u64,
+}
 
-#[derive(Default)]
-pub(crate) struct RegionLeaseHandler;
+impl RegionLeaseHandler {
+    pub fn new(region_lease_seconds: u64) -> Self {
+        Self {
+            region_lease_seconds,
+        }
+    }
+}
 
 #[async_trait]
 impl HeartbeatHandler for RegionLeaseHandler {
@@ -47,37 +48,19 @@ impl HeartbeatHandler for RegionLeaseHandler {
             return Ok(());
         };
 
-        let mut table_region_leases = HashMap::new();
-        stat.region_stats.iter().for_each(|region_stat| {
-            let table_ident = region_stat.table_ident.clone();
-            table_region_leases
-                .entry(table_ident)
-                .or_insert_with(Vec::new)
-                .push(RegionId::from(region_stat.id).region_number());
+        let mut region_ids = stat.region_ids();
+
+        let inactive_region_manager = InactiveRegionManager::new(&ctx.in_memory);
+        let inactive_region_ids = inactive_region_manager
+            .retain_active_regions(stat.cluster_id, stat.id, &mut region_ids)
+            .await?;
+
+        acc.inactive_region_ids = inactive_region_ids;
+        acc.region_lease = Some(RegionLease {
+            region_ids,
+            duration_since_epoch: req.duration_since_epoch,
+            lease_seconds: self.region_lease_seconds,
         });
-
-        let inactive_node_manager = InactiveNodeManager::new(&ctx.in_memory);
-        for (table_ident, region_numbers) in table_region_leases.iter_mut() {
-            inactive_node_manager
-                .retain_active_regions(
-                    stat.cluster_id,
-                    stat.id,
-                    table_ident.table_id,
-                    region_numbers,
-                )
-                .await?;
-        }
-
-        acc.region_leases = table_region_leases
-            .into_iter()
-            .filter(|(_, regions)| !regions.is_empty()) // filter out empty region_numbers
-            .map(|(table_ident, regions)| RegionLease {
-                table_ident: Some(table_ident.into()),
-                regions,
-                duration_since_epoch: req.duration_since_epoch,
-                lease_seconds: REGION_LEASE_SECONDS,
-            })
-            .collect();
 
         Ok(())
     }
@@ -87,11 +70,9 @@ impl HeartbeatHandler for RegionLeaseHandler {
 mod test {
     use std::sync::Arc;
 
-    use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
-    use common_meta::ident::TableIdent;
     use common_meta::key::TableMetadataManager;
-    use common_meta::RegionIdent;
-    use store_api::storage::RegionNumber;
+    use common_meta::{distributed_time_constants, RegionIdent};
+    use store_api::storage::{RegionId, RegionNumber};
 
     use super::*;
     use crate::handler::node_stat::{RegionStat, Stat};
@@ -119,14 +100,6 @@ mod test {
         )
         .await;
 
-        let table_ident = TableIdent {
-            catalog: DEFAULT_CATALOG_NAME.to_string(),
-            schema: DEFAULT_SCHEMA_NAME.to_string(),
-            table: table_name.to_string(),
-            table_id,
-            engine: "mito".to_string(),
-        };
-
         let req = HeartbeatRequest {
             duration_since_epoch: 1234,
             ..Default::default()
@@ -141,13 +114,6 @@ mod test {
             let region_id = RegionId::new(table_id, region_number);
             RegionStat {
                 id: region_id.as_u64(),
-                table_ident: TableIdent {
-                    catalog: DEFAULT_CATALOG_NAME.to_string(),
-                    schema: DEFAULT_SCHEMA_NAME.to_string(),
-                    table: table_name.to_string(),
-                    table_id: 1,
-                    engine: "mito".to_string(),
-                },
                 ..Default::default()
             }
         };
@@ -158,39 +124,40 @@ mod test {
             ..Default::default()
         });
 
-        let inactive_node_manager = InactiveNodeManager::new(&ctx.in_memory);
-        inactive_node_manager
+        let inactive_region_manager = InactiveRegionManager::new(&ctx.in_memory);
+        inactive_region_manager
             .register_inactive_region(&RegionIdent {
                 cluster_id: 1,
                 datanode_id: 1,
-                table_ident: TableIdent {
-                    table_id: 1,
-                    ..Default::default()
-                },
+                table_id: 1,
                 region_number: 1,
+                engine: "mito2".to_string(),
             })
             .await
             .unwrap();
-        inactive_node_manager
+        inactive_region_manager
             .register_inactive_region(&RegionIdent {
                 cluster_id: 1,
                 datanode_id: 1,
-                table_ident: TableIdent {
-                    table_id: 1,
-                    ..Default::default()
-                },
+                table_id: 1,
                 region_number: 3,
+                engine: "mito2".to_string(),
             })
             .await
             .unwrap();
 
-        RegionLeaseHandler.handle(&req, ctx, acc).await.unwrap();
+        RegionLeaseHandler::new(distributed_time_constants::REGION_LEASE_SECS)
+            .handle(&req, ctx, acc)
+            .await
+            .unwrap();
 
-        assert_eq!(acc.region_leases.len(), 1);
-        let lease = acc.region_leases.remove(0);
-        assert_eq!(lease.table_ident.unwrap(), table_ident.into());
-        assert_eq!(lease.regions, vec![2]);
+        assert!(acc.region_lease.is_some());
+        let lease = acc.region_lease.as_ref().unwrap();
+        assert_eq!(lease.region_ids, vec![RegionId::new(table_id, 2).as_u64()]);
         assert_eq!(lease.duration_since_epoch, 1234);
-        assert_eq!(lease.lease_seconds, REGION_LEASE_SECONDS);
+        assert_eq!(
+            lease.lease_seconds,
+            distributed_time_constants::REGION_LEASE_SECS
+        );
     }
 }

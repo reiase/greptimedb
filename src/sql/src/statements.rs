@@ -20,25 +20,30 @@ pub mod describe;
 pub mod drop;
 pub mod explain;
 pub mod insert;
+mod option_map;
 pub mod query;
 pub mod show;
 pub mod statement;
 pub mod tql;
+mod transform;
 pub mod truncate;
 
 use std::str::FromStr;
 
 use api::helper::ColumnDataTypeWrapper;
-use api::v1::add_column::location::LocationType;
-use api::v1::add_column::Location;
+use api::v1::add_column_location::LocationType;
+use api::v1::{AddColumnLocation as Location, SemanticType};
 use common_base::bytes::Bytes;
 use common_query::AddColumnLocation;
 use common_time::Timestamp;
 use datatypes::prelude::ConcreteDataType;
 use datatypes::schema::{ColumnDefaultConstraint, ColumnSchema, COMMENT_KEY};
-use datatypes::types::TimestampType;
-use datatypes::value::Value;
+use datatypes::types::cast::CastOption;
+use datatypes::types::{cast, TimestampType};
+use datatypes::value::{OrderedF32, OrderedF64, Value};
+pub use option_map::OptionMap;
 use snafu::{ensure, OptionExt, ResultExt};
+pub use transform::{get_data_type_by_alias_name, transform_statements};
 
 use crate::ast::{
     ColumnDef, ColumnOption, ColumnOptionDef, DataType as SqlDataType, Expr, TimezoneInfo,
@@ -46,7 +51,7 @@ use crate::ast::{
 };
 use crate::error::{
     self, ColumnTypeMismatchSnafu, ConvertSqlValueSnafu, ConvertToGrpcDataTypeSnafu,
-    ConvertValueSnafu, InvalidSqlValueSnafu, ParseSqlValueSnafu, Result,
+    ConvertValueSnafu, InvalidCastSnafu, InvalidSqlValueSnafu, ParseSqlValueSnafu, Result,
     SerializeColumnDefaultConstraintSnafu, TimestampOverflowSnafu, UnsupportedDefaultValueSnafu,
 };
 
@@ -128,18 +133,23 @@ fn parse_hex_string(s: &str) -> Result<Value> {
 }
 
 macro_rules! parse_number_to_value {
-    ($data_type: expr, $n: ident,  $(($Type: ident, $PrimitiveType: ident)), +) => {
+    ($data_type: expr, $n: ident,  $(($Type: ident, $PrimitiveType: ident, $Target: ident)), +) => {
         match $data_type {
             $(
                 ConcreteDataType::$Type(_) => {
                     let n  = parse_sql_number::<$PrimitiveType>($n)?;
-                    Ok(Value::from(n))
+                    Ok(Value::$Type($Target::from(n)))
                 },
             )+
-                _ => ParseSqlValueSnafu {
-                    msg: format!("Fail to parse number {}, invalid column type: {:?}",
-                                 $n, $data_type
-                    )}.fail(),
+            ConcreteDataType::Timestamp(t) => {
+                let n  = parse_sql_number::<i64>($n)?;
+                Ok(Value::Timestamp(Timestamp::new(n, t.unit())))
+            },
+
+            _ => ParseSqlValueSnafu {
+                msg: format!("Fail to parse number {}, invalid column type: {:?}",
+                                $n, $data_type
+                )}.fail(),
         }
     }
 }
@@ -149,17 +159,16 @@ pub fn sql_number_to_value(data_type: &ConcreteDataType, n: &str) -> Result<Valu
     parse_number_to_value!(
         data_type,
         n,
-        (UInt8, u8),
-        (UInt16, u16),
-        (UInt32, u32),
-        (UInt64, u64),
-        (Int8, i8),
-        (Int16, i16),
-        (Int32, i32),
-        (Int64, i64),
-        (Float64, f64),
-        (Float32, f32),
-        (Timestamp, i64)
+        (UInt8, u8, u8),
+        (UInt16, u16, u16),
+        (UInt32, u32, u32),
+        (UInt64, u64, u64),
+        (Int8, i8, i8),
+        (Int16, i16, i16),
+        (Int32, i32, i32),
+        (Int64, i64, i64),
+        (Float64, f64, OrderedF64),
+        (Float32, f32, OrderedF32)
     )
     // TODO(hl): also Date/DateTime
 }
@@ -182,7 +191,7 @@ pub fn sql_value_to_value(
     data_type: &ConcreteDataType,
     sql_val: &SqlValue,
 ) -> Result<Value> {
-    Ok(match sql_val {
+    let value = match sql_val {
         SqlValue::Number(n, _) => sql_number_to_value(data_type, n)?,
         SqlValue::Null => Value::Null,
         SqlValue::Boolean(b) => {
@@ -211,7 +220,17 @@ pub fn sql_value_to_value(
             }
             .fail()
         }
-    })
+    };
+    if value.data_type() != *data_type {
+        cast::cast_with_opt(value, data_type, &CastOption { strict: true }).with_context(|_| {
+            InvalidCastSnafu {
+                sql_value: sql_val.clone(),
+                datatype: data_type,
+            }
+        })
+    } else {
+        Ok(value)
+    }
 }
 
 pub fn value_to_sql_value(val: &Value) -> Result<SqlValue> {
@@ -268,6 +287,17 @@ fn parse_column_default_constraint(
     } else {
         Ok(None)
     }
+}
+
+/// Return true when the `ColumnDef` options contain primary key
+pub fn has_primary_key_option(column_def: &ColumnDef) -> bool {
+    column_def
+        .options
+        .iter()
+        .any(|options| match options.option {
+            ColumnOption::Unique { is_primary } => is_primary,
+            _ => false,
+        })
 }
 
 // TODO(yingwen): Make column nullable by default, and checks invalid case like
@@ -327,9 +357,12 @@ pub fn sql_column_def_to_grpc_column_def(col: &ColumnDef) -> Result<api::v1::Col
         .datatype() as i32;
     Ok(api::v1::ColumnDef {
         name,
-        datatype: data_type,
+        data_type,
         is_nullable,
         default_constraint: default_constraint.unwrap_or_default(),
+        // TODO(#1308): support adding new primary key columns
+        semantic_type: SemanticType::Field as _,
+        comment: String::new(),
     })
 }
 
@@ -401,25 +434,28 @@ pub fn concrete_data_type_to_sql_data_type(data_type: &ConcreteDataType) -> Resu
             Some(time_type.precision()),
             TimezoneInfo::None,
         )),
+        ConcreteDataType::Interval(_) => Ok(SqlDataType::Interval),
         ConcreteDataType::Binary(_) => Ok(SqlDataType::Varbinary(None)),
-        ConcreteDataType::Null(_) | ConcreteDataType::List(_) | ConcreteDataType::Dictionary(_) => {
+        ConcreteDataType::Duration(_)
+        | ConcreteDataType::Null(_)
+        | ConcreteDataType::List(_)
+        | ConcreteDataType::Dictionary(_) => {
             unreachable!()
         }
-        ConcreteDataType::Interval(_) => Ok(SqlDataType::Interval),
     }
 }
 
 pub fn sql_location_to_grpc_add_column_location(
     location: &Option<AddColumnLocation>,
-) -> Option<api::v1::add_column::Location> {
+) -> Option<Location> {
     match location {
         Some(AddColumnLocation::First) => Some(Location {
             location_type: LocationType::First.into(),
-            after_cloumn_name: "".to_string(),
+            after_column_name: "".to_string(),
         }),
         Some(AddColumnLocation::After { column_name }) => Some(Location {
             location_type: LocationType::After.into(),
-            after_cloumn_name: column_name.to_string(),
+            after_column_name: column_name.to_string(),
         }),
         None => None,
     }
@@ -515,6 +551,20 @@ mod tests {
 
         let v = sql_number_to_value(&ConcreteDataType::int32_datatype(), "999").unwrap();
         assert_eq!(Value::Int32(999), v);
+
+        let v = sql_number_to_value(
+            &ConcreteDataType::timestamp_nanosecond_datatype(),
+            "1073741821",
+        )
+        .unwrap();
+        assert_eq!(Value::Timestamp(Timestamp::new_nanosecond(1073741821)), v);
+
+        let v = sql_number_to_value(
+            &ConcreteDataType::timestamp_millisecond_datatype(),
+            "999999",
+        )
+        .unwrap();
+        assert_eq!(Value::Timestamp(Timestamp::new_millisecond(999999)), v);
 
         let v = sql_number_to_value(&ConcreteDataType::string_datatype(), "999");
         assert!(v.is_err(), "parse value error is: {v:?}");
@@ -730,7 +780,7 @@ mod tests {
 
         assert_eq!("col", grpc_column_def.name);
         assert!(grpc_column_def.is_nullable); // nullable when options are empty
-        assert_eq!(ColumnDataType::Float64 as i32, grpc_column_def.datatype);
+        assert_eq!(ColumnDataType::Float64 as i32, grpc_column_def.data_type);
         assert!(grpc_column_def.default_constraint.is_empty());
 
         // test not null
@@ -746,6 +796,28 @@ mod tests {
 
         let grpc_column_def = sql_column_def_to_grpc_column_def(&column_def).unwrap();
         assert!(!grpc_column_def.is_nullable);
+    }
+
+    #[test]
+    pub fn test_has_primary_key_option() {
+        let column_def = ColumnDef {
+            name: "col".into(),
+            data_type: SqlDataType::Double,
+            collation: None,
+            options: vec![],
+        };
+        assert!(!has_primary_key_option(&column_def));
+
+        let column_def = ColumnDef {
+            name: "col".into(),
+            data_type: SqlDataType::Double,
+            collation: None,
+            options: vec![ColumnOptionDef {
+                name: None,
+                option: ColumnOption::Unique { is_primary: true },
+            }],
+        };
+        assert!(has_primary_key_option(&column_def));
     }
 
     #[test]

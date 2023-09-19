@@ -40,7 +40,7 @@ pub type WalEntryStream<'a> = BoxStream<'a, Result<(EntryId, WalEntry)>>;
 /// Write ahead log.
 ///
 /// All regions in the engine shares the same WAL instance.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Wal<S> {
     /// The underlying log store.
     store: Arc<S>,
@@ -203,7 +203,7 @@ mod tests {
                         value_data: Some(value::ValueData::StringValue(str_col.to_string())),
                     },
                     Value {
-                        value_data: Some(value::ValueData::TsMillisecondValue(*int_col)),
+                        value_data: Some(value::ValueData::TimestampMillisecondValue(*int_col)),
                     },
                 ];
                 Row { values }

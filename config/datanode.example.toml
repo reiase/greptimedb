@@ -1,7 +1,5 @@
 # Node running mode, see `standalone.example.toml`.
 mode = "distributed"
-# Whether to use in-memory catalog, see `standalone.example.toml`.
-enable_memory_catalog = false
 # The datanode identifier, should be unique.
 node_id = 42
 # gRPC server address, "127.0.0.1:3001" by default.
@@ -10,13 +8,16 @@ rpc_addr = "127.0.0.1:3001"
 rpc_hostname = "127.0.0.1"
 # The number of gRPC server worker threads, 8 by default.
 rpc_runtime_size = 8
+# Start services after regions have obtained leases.
+# It will block the datanode start if it can't receive leases in the heartbeat from metasrv.
+require_lease_before_startup = false
 
 [heartbeat]
 # Interval for sending heartbeat messages to the Metasrv in milliseconds, 5000 by default.
 interval_millis = 5000
 
 # Metasrv client options.
-[meta_client_options]
+[meta_client]
 # Metasrv address list.
 metasrv_addrs = ["127.0.0.1:3002"]
 # Operation timeout in milliseconds, 3000 by default.
@@ -71,10 +72,27 @@ auto_flush_interval = "1h"
 # Global write buffer size for all regions.
 global_write_buffer_size = "1GB"
 
-# Procedure storage options, see `standalone.example.toml`.
-[procedure]
-max_retry_times = 3
-retry_delay = "500ms"
+# Mito engine options
+[[region_engine]]
+[region_engine.mito]
+# Number of region workers
+num_workers = 8
+# Request channel size of each worker
+worker_channel_size = 128
+# Max batch size for a worker to handle requests
+worker_request_batch_size = 64
+# Number of meta action updated to trigger a new checkpoint for the manifest
+manifest_checkpoint_distance = 10
+# Manifest compression type
+manifest_compress_type = "Uncompressed"
+# Max number of running background jobs
+max_background_jobs = 4
+# Interval to auto flush a region if it has not flushed yet.
+auto_flush_interval = "1h"
+# Global write buffer size for all regions.
+global_write_buffer_size = "1GB"
+# Global write buffer size threshold to reject write requests (default 2G).
+global_write_buffer_reject_size = "2GB"
 
 # Log options
 # [logging]

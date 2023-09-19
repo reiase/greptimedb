@@ -23,6 +23,8 @@
 //! ```text
 //! field 0, field 1, ..., field N, time index, primary key, sequence, op type
 //! ```
+//!
+//! We stores fields in the same order as [RegionMetadata::field_columns()](store_api::metadata::RegionMetadata::field_columns()).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -134,6 +136,11 @@ impl ReadFormat {
     /// Gets the converted arrow schema.
     pub(crate) fn arrow_schema(&self) -> &SchemaRef {
         &self.arrow_schema
+    }
+
+    /// Gets the metadata of the SST.
+    pub(crate) fn metadata(&self) -> &RegionMetadataRef {
+        &self.metadata
     }
 
     /// Gets sorted projection indices to read `columns` from parquet files.

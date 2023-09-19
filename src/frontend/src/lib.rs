@@ -15,15 +15,10 @@
 #![feature(assert_matches)]
 #![feature(trait_upcasting)]
 
-pub mod catalog;
 pub mod error;
-pub mod expr_factory;
 pub mod frontend;
 pub mod heartbeat;
 pub mod instance;
 pub(crate) mod metrics;
-mod row_inserter;
 mod server;
 pub mod service_config;
-pub mod statement;
-pub mod table;

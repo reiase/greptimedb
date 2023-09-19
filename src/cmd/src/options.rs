@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use common_config::KvStoreConfig;
 use common_telemetry::logging::LoggingOptions;
 use config::{Config, Environment, File, FileFormat};
-use datanode::datanode::DatanodeOptions;
+use datanode::config::{DatanodeOptions, ProcedureConfig};
 use frontend::frontend::FrontendOptions;
 use meta_srv::metasrv::MetaSrvOptions;
 use serde::{Deserialize, Serialize};
@@ -25,10 +26,14 @@ use crate::error::{LoadLayeredConfigSnafu, Result};
 pub const ENV_VAR_SEP: &str = "__";
 pub const ENV_LIST_SEP: &str = ",";
 
+/// Options mixed up from datanode, frontend and metasrv.
 pub struct MixOptions {
+    pub data_home: String,
+    pub procedure_cfg: ProcedureConfig,
+    pub kv_store_cfg: KvStoreConfig,
     pub fe_opts: FrontendOptions,
     pub dn_opts: DatanodeOptions,
-    pub logging: LoggingOptions,
+    pub logging_opts: LoggingOptions,
 }
 
 pub enum Options {
@@ -51,7 +56,7 @@ impl Options {
             Options::Datanode(opts) => &opts.logging,
             Options::Frontend(opts) => &opts.logging,
             Options::Metasrv(opts) => &opts.logging,
-            Options::Standalone(opts) => &opts.logging,
+            Options::Standalone(opts) => &opts.logging_opts,
             Options::Cli(opts) => opts,
         }
     }
@@ -115,7 +120,7 @@ mod tests {
     use std::time::Duration;
 
     use common_test_util::temp_dir::create_named_temp_file;
-    use datanode::datanode::{DatanodeOptions, ObjectStoreConfig};
+    use datanode::config::{DatanodeOptions, ObjectStoreConfig};
 
     use super::*;
 
@@ -131,7 +136,7 @@ mod tests {
             mysql_addr = "127.0.0.1:4406"
             mysql_runtime_size = 2
 
-            [meta_client_options]
+            [meta_client]
             timeout_millis = 3000
             connect_timeout_millis = 5000
             tcp_nodelay = true
@@ -212,10 +217,10 @@ mod tests {
                     Some("/other/wal/dir"),
                 ),
                 (
-                    // meta_client_options.metasrv_addrs = 127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003
+                    // meta_client.metasrv_addrs = 127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003
                     [
                         env_prefix.to_string(),
-                        "meta_client_options".to_uppercase(),
+                        "meta_client".to_uppercase(),
                         "metasrv_addrs".to_uppercase(),
                     ]
                     .join(ENV_VAR_SEP),
@@ -243,16 +248,13 @@ mod tests {
                     Some(Duration::from_secs(42))
                 );
                 assert_eq!(
-                    opts.meta_client_options.unwrap().metasrv_addrs,
+                    opts.meta_client.unwrap().metasrv_addrs,
                     vec![
                         "127.0.0.1:3001".to_string(),
                         "127.0.0.1:3002".to_string(),
                         "127.0.0.1:3003".to_string()
                     ]
                 );
-
-                // Should be the values from config file, not environment variables.
-                assert_eq!(opts.wal.dir.unwrap(), "/tmp/greptimedb/wal");
 
                 // Should be default values.
                 assert_eq!(opts.node_id, None);

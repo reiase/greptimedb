@@ -18,8 +18,9 @@ use object_store::{util, ObjectStore};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 
-use crate::datanode::AzblobConfig;
+use crate::config::AzblobConfig;
 use crate::error::{self, Result};
+use crate::store::build_http_client;
 
 pub(crate) async fn new_azblob_object_store(azblob_config: &AzblobConfig) -> Result<ObjectStore> {
     let root = util::normalize_dir(&azblob_config.root);
@@ -35,7 +36,8 @@ pub(crate) async fn new_azblob_object_store(azblob_config: &AzblobConfig) -> Res
         .container(&azblob_config.container)
         .endpoint(&azblob_config.endpoint)
         .account_name(azblob_config.account_name.expose_secret())
-        .account_key(azblob_config.account_key.expose_secret());
+        .account_key(azblob_config.account_key.expose_secret())
+        .http_client(build_http_client()?);
 
     if let Some(token) = &azblob_config.sas_token {
         let _ = builder.sas_token(token);

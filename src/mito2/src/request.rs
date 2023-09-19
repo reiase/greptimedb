@@ -15,49 +15,37 @@
 //! Worker requests.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Arc;
 
 use api::helper::{
     is_column_type_value_eq, is_semantic_type_eq, proto_value_type, to_column_data_type,
     to_proto_value,
 };
-use api::v1::{ColumnDataType, ColumnSchema, OpType, Rows, Value};
-use common_base::readable_size::ReadableSize;
+use api::v1::{ColumnDataType, ColumnSchema, OpType, Rows, SemanticType, Value};
 use common_query::Output;
+use common_query::Output::AffectedRows;
+use common_telemetry::tracing::log::info;
+use common_telemetry::warn;
+use datatypes::prelude::DataType;
+use prost::Message;
+use smallvec::SmallVec;
 use snafu::{ensure, OptionExt, ResultExt};
 use store_api::metadata::{ColumnMetadata, RegionMetadata};
 use store_api::region_request::{
     RegionAlterRequest, RegionCloseRequest, RegionCompactRequest, RegionCreateRequest,
-    RegionDropRequest, RegionFlushRequest, RegionOpenRequest, RegionRequest,
+    RegionDropRequest, RegionFlushRequest, RegionOpenRequest, RegionRequest, RegionTruncateRequest,
 };
-use store_api::storage::{CompactionStrategy, RegionId};
+use store_api::storage::{RegionId, SequenceNumber};
 use tokio::sync::oneshot::{self, Receiver, Sender};
 
-use crate::config::DEFAULT_WRITE_BUFFER_SIZE;
-use crate::error::{CreateDefaultSnafu, FillDefaultSnafu, InvalidRequestSnafu, Result};
-
-/// Options that affect the entire region.
-///
-/// Users need to specify the options while creating/opening a region.
-#[derive(Debug)]
-pub struct RegionOptions {
-    /// Region memtable max size in bytes.
-    pub write_buffer_size: Option<ReadableSize>,
-    /// Region SST files TTL.
-    pub ttl: Option<Duration>,
-    /// Compaction strategy.
-    pub compaction_strategy: CompactionStrategy,
-}
-
-impl Default for RegionOptions {
-    fn default() -> Self {
-        RegionOptions {
-            write_buffer_size: Some(DEFAULT_WRITE_BUFFER_SIZE),
-            ttl: None,
-            compaction_strategy: CompactionStrategy::LeveledTimeWindow,
-        }
-    }
-}
+use crate::error::{
+    CompactRegionSnafu, CreateDefaultSnafu, Error, FillDefaultSnafu, FlushRegionSnafu,
+    InvalidRequestSnafu, Result,
+};
+use crate::memtable::MemtableId;
+use crate::sst::file::FileMeta;
+use crate::sst::file_purger::{FilePurgerRef, PurgeRequest};
+use crate::wal::EntryId;
 
 /// Request to write a region.
 #[derive(Debug)]
@@ -124,17 +112,29 @@ impl WriteRequest {
         })
     }
 
-    /// Get column index by name.
+    /// Returns estimated size of the request.
+    pub(crate) fn estimated_size(&self) -> usize {
+        let row_size = self
+            .rows
+            .rows
+            .get(0)
+            .map(|row| row.encoded_len())
+            .unwrap_or(0);
+        row_size * self.rows.rows.len()
+    }
+
+    /// Gets column index by name.
     pub(crate) fn column_index_by_name(&self, name: &str) -> Option<usize> {
         self.name_to_index.get(name).copied()
     }
 
-    // TODO(yingwen): Check delete schema.
     /// Checks schema of rows is compatible with schema of the region.
     ///
     /// If column with default value is missing, it returns a special [FillDefault](crate::error::Error::FillDefault)
     /// error.
     pub(crate) fn check_schema(&self, metadata: &RegionMetadata) -> Result<()> {
+        debug_assert_eq!(self.region_id, metadata.region_id);
+
         let region_id = self.region_id;
         // Index all columns in rows.
         let mut rows_columns: HashMap<_, _> = self
@@ -188,19 +188,15 @@ impl WriteRequest {
                     !has_null || column.column_schema.is_nullable(),
                     InvalidRequestSnafu {
                         region_id,
-                        reason: format!("column {} is not null", column.column_schema.name),
+                        reason: format!(
+                            "column {} is not null but input has null",
+                            column.column_schema.name
+                        ),
                     }
                 );
             } else {
-                // For columns not in rows, checks whether they have default value.
-                ensure!(
-                    column.column_schema.is_nullable()
-                        || column.column_schema.default_constraint().is_some(),
-                    InvalidRequestSnafu {
-                        region_id,
-                        reason: format!("missing column {}", column.column_schema.name),
-                    }
-                );
+                // Rows don't have this column.
+                self.check_missing_column(column)?;
 
                 return FillDefaultSnafu { region_id }.fail();
             }
@@ -219,48 +215,26 @@ impl WriteRequest {
         Ok(())
     }
 
-    /// Try to fill missing columns.
+    /// Tries to fill missing columns.
     ///
     /// Currently, our protobuf format might be inefficient when we need to fill lots of null
     /// values.
     pub(crate) fn fill_missing_columns(&mut self, metadata: &RegionMetadata) -> Result<()> {
+        debug_assert_eq!(self.region_id, metadata.region_id);
+
         for column in &metadata.column_metadatas {
             if !self.name_to_index.contains_key(&column.column_schema.name) {
-                self.fill_column(metadata.region_id, column)?;
+                self.fill_column(column)?;
             }
         }
 
         Ok(())
     }
 
-    /// Fill default value for specific `column`.
-    fn fill_column(&mut self, region_id: RegionId, column: &ColumnMetadata) -> Result<()> {
+    /// Fills default value for specific `column`.
+    fn fill_column(&mut self, column: &ColumnMetadata) -> Result<()> {
         // Need to add a default value for this column.
-        let default_value = column
-            .column_schema
-            .create_default()
-            .context(CreateDefaultSnafu {
-                region_id,
-                column: &column.column_schema.name,
-            })?
-            // This column doesn't have default value.
-            .with_context(|| InvalidRequestSnafu {
-                region_id,
-                reason: format!(
-                    "column {} does not have default value",
-                    column.column_schema.name
-                ),
-            })?;
-
-        // Convert default value into proto's value.
-
-        let proto_value = to_proto_value(default_value).with_context(|| InvalidRequestSnafu {
-            region_id,
-            reason: format!(
-                "no protobuf type for default value of column {} ({:?})",
-                column.column_schema.name, column.column_schema.data_type
-            ),
-        })?;
+        let proto_value = self.column_default_value(column)?;
 
         // Insert default value to each row.
         for row in &mut self.rows.rows {
@@ -270,7 +244,7 @@ impl WriteRequest {
         // Insert column schema.
         let datatype = to_column_data_type(&column.column_schema.data_type).with_context(|| {
             InvalidRequestSnafu {
-                region_id,
+                region_id: self.region_id,
                 reason: format!(
                     "no protobuf type for column {} ({:?})",
                     column.column_schema.name, column.column_schema.data_type
@@ -284,6 +258,86 @@ impl WriteRequest {
         });
 
         Ok(())
+    }
+
+    /// Checks whether we should allow a row doesn't provide this column.
+    fn check_missing_column(&self, column: &ColumnMetadata) -> Result<()> {
+        // For delete request, all tags and timestamp is required. We don't fill default
+        // tag or timestamp while deleting rows.
+        ensure!(
+            self.op_type != OpType::Delete || column.semantic_type == SemanticType::Field,
+            InvalidRequestSnafu {
+                region_id: self.region_id,
+                reason: format!("delete requests need column {}", column.column_schema.name),
+            }
+        );
+
+        // Checks whether they have default value.
+        ensure!(
+            column.column_schema.is_nullable()
+                || column.column_schema.default_constraint().is_some(),
+            InvalidRequestSnafu {
+                region_id: self.region_id,
+                reason: format!("missing column {}", column.column_schema.name),
+            }
+        );
+
+        Ok(())
+    }
+
+    /// Returns the default value for specific column.
+    fn column_default_value(&self, column: &ColumnMetadata) -> Result<Value> {
+        let default_value = match self.op_type {
+            OpType::Delete => {
+                ensure!(
+                    column.semantic_type == SemanticType::Field,
+                    InvalidRequestSnafu {
+                        region_id: self.region_id,
+                        reason: format!(
+                            "delete requests need column {}",
+                            column.column_schema.name
+                        ),
+                    }
+                );
+
+                // For delete request, we need a default value for padding so we
+                // can delete a row even a field doesn't have a default value. So the
+                // value doesn't need to following the default value constraint of the
+                // column.
+                if column.column_schema.is_nullable() {
+                    datatypes::value::Value::Null
+                } else {
+                    column.column_schema.data_type.default_value()
+                }
+            }
+            OpType::Put => {
+                // For put requests, we use the default value from column schema.
+                column
+                    .column_schema
+                    .create_default()
+                    .context(CreateDefaultSnafu {
+                        region_id: self.region_id,
+                        column: &column.column_schema.name,
+                    })?
+                    // This column doesn't have default value.
+                    .with_context(|| InvalidRequestSnafu {
+                        region_id: self.region_id,
+                        reason: format!(
+                            "column {} does not have default value",
+                            column.column_schema.name
+                        ),
+                    })?
+            }
+        };
+
+        // Convert default value into proto's value.
+        to_proto_value(default_value).with_context(|| InvalidRequestSnafu {
+            region_id: self.region_id,
+            reason: format!(
+                "no protobuf type for default value of column {} ({:?})",
+                column.column_schema.name, column.column_schema.data_type
+            ),
+        })
     }
 }
 
@@ -299,10 +353,11 @@ pub(crate) fn validate_proto_value(
             InvalidRequestSnafu {
                 region_id,
                 reason: format!(
-                    "column {} has type {:?}, but schema has type {:?}",
-                    column_schema.column_name,
+                    "value has type {:?}, but column {} has type {:?}({})",
                     value_type,
-                    ColumnDataType::from_i32(column_schema.datatype)
+                    column_schema.column_name,
+                    ColumnDataType::from_i32(column_schema.datatype),
+                    column_schema.datatype,
                 ),
             }
         );
@@ -311,60 +366,181 @@ pub(crate) fn validate_proto_value(
     Ok(())
 }
 
+/// Oneshot output result sender.
+#[derive(Debug)]
+pub(crate) struct OutputTx(Sender<Result<Output>>);
+
+impl OutputTx {
+    /// Creates a new output sender.
+    pub(crate) fn new(sender: Sender<Result<Output>>) -> OutputTx {
+        OutputTx(sender)
+    }
+
+    /// Sends the `result`.
+    pub(crate) fn send(self, result: Result<Output>) {
+        // Ignores send result.
+        let _ = self.0.send(result);
+    }
+}
+
+/// Optional output result sender.
+#[derive(Debug)]
+pub(crate) struct OptionOutputTx(Option<OutputTx>);
+
+impl OptionOutputTx {
+    /// Creates a sender.
+    pub(crate) fn new(sender: Option<OutputTx>) -> OptionOutputTx {
+        OptionOutputTx(sender)
+    }
+
+    /// Creates an empty sender.
+    pub(crate) fn none() -> OptionOutputTx {
+        OptionOutputTx(None)
+    }
+
+    /// Sends the `result` and consumes the inner sender.
+    pub(crate) fn send_mut(&mut self, result: Result<Output>) {
+        if let Some(sender) = self.0.take() {
+            sender.send(result);
+        }
+    }
+
+    /// Sends the `result` and consumes the sender.
+    pub(crate) fn send(mut self, result: Result<Output>) {
+        if let Some(sender) = self.0.take() {
+            sender.send(result);
+        }
+    }
+
+    /// Takes the sender.
+    pub(crate) fn take(&mut self) -> OptionOutputTx {
+        OptionOutputTx(self.0.take())
+    }
+
+    /// Takes the inner sender.
+    pub(crate) fn take_inner(&mut self) -> Option<OutputTx> {
+        self.0.take()
+    }
+}
+
+impl From<Sender<Result<Output>>> for OptionOutputTx {
+    fn from(sender: Sender<Result<Output>>) -> Self {
+        Self::new(Some(OutputTx::new(sender)))
+    }
+}
+
+impl OnFailure for OptionOutputTx {
+    fn on_failure(&mut self, err: Error) {
+        self.send_mut(Err(err));
+    }
+}
+
+/// Callback on failure.
+pub(crate) trait OnFailure {
+    /// Handles `err` on failure.
+    fn on_failure(&mut self, err: Error);
+}
+
 /// Sender and write request.
+#[derive(Debug)]
 pub(crate) struct SenderWriteRequest {
     /// Result sender.
-    pub(crate) sender: Option<Sender<Result<Output>>>,
+    pub(crate) sender: OptionOutputTx,
     pub(crate) request: WriteRequest,
 }
 
 /// Request sent to a worker
+#[derive(Debug)]
 pub(crate) enum WorkerRequest {
-    /// Region request.
-    Region(RegionTask),
+    /// Write to a region.
+    Write(SenderWriteRequest),
+
+    /// Ddl request to a region.
+    Ddl(SenderDdlRequest),
+
+    /// Notifications from internal background jobs.
+    Background {
+        /// Id of the region to send.
+        region_id: RegionId,
+        /// Internal notification.
+        notify: BackgroundNotify,
+    },
 
     /// Notify a worker to stop.
     Stop,
 }
 
-/// Request to modify a region.
-#[derive(Debug)]
-pub(crate) struct RegionTask {
-    /// Sender to send result.
-    ///
-    /// Now the result is a `Result<()>`, but we could replace the empty tuple
-    /// with an enum if we need to carry more information.
-    pub(crate) sender: Option<Sender<Result<Output>>>,
-    /// Request body.
-    pub(crate) body: RequestBody,
-    /// Region identifier.
-    pub(crate) region_id: RegionId,
-}
-
-impl RegionTask {
-    /// Creates a [RegionTask] and a receiver from request body.
-    pub(crate) fn from_request(
+impl WorkerRequest {
+    /// Converts request from a [RegionRequest].
+    pub(crate) fn try_from_region_request(
         region_id: RegionId,
-        body: RequestBody,
-    ) -> (RegionTask, Receiver<Result<Output>>) {
+        value: RegionRequest,
+    ) -> Result<(WorkerRequest, Receiver<Result<Output>>)> {
         let (sender, receiver) = oneshot::channel();
-        (
-            RegionTask {
-                sender: Some(sender),
-                body,
+        let worker_request = match value {
+            RegionRequest::Put(v) => {
+                let write_request = WriteRequest::new(region_id, OpType::Put, v.rows)?;
+                WorkerRequest::Write(SenderWriteRequest {
+                    sender: sender.into(),
+                    request: write_request,
+                })
+            }
+            RegionRequest::Delete(v) => {
+                let write_request = WriteRequest::new(region_id, OpType::Delete, v.rows)?;
+                WorkerRequest::Write(SenderWriteRequest {
+                    sender: sender.into(),
+                    request: write_request,
+                })
+            }
+            RegionRequest::Create(v) => WorkerRequest::Ddl(SenderDdlRequest {
                 region_id,
-            },
-            receiver,
-        )
+                sender: sender.into(),
+                request: DdlRequest::Create(v),
+            }),
+            RegionRequest::Drop(v) => WorkerRequest::Ddl(SenderDdlRequest {
+                region_id,
+                sender: sender.into(),
+                request: DdlRequest::Drop(v),
+            }),
+            RegionRequest::Open(v) => WorkerRequest::Ddl(SenderDdlRequest {
+                region_id,
+                sender: sender.into(),
+                request: DdlRequest::Open(v),
+            }),
+            RegionRequest::Close(v) => WorkerRequest::Ddl(SenderDdlRequest {
+                region_id,
+                sender: sender.into(),
+                request: DdlRequest::Close(v),
+            }),
+            RegionRequest::Alter(v) => WorkerRequest::Ddl(SenderDdlRequest {
+                region_id,
+                sender: sender.into(),
+                request: DdlRequest::Alter(v),
+            }),
+            RegionRequest::Flush(v) => WorkerRequest::Ddl(SenderDdlRequest {
+                region_id,
+                sender: sender.into(),
+                request: DdlRequest::Flush(v),
+            }),
+            RegionRequest::Compact(v) => WorkerRequest::Ddl(SenderDdlRequest {
+                region_id,
+                sender: sender.into(),
+                request: DdlRequest::Compact(v),
+            }),
+            RegionRequest::Truncate(v) => WorkerRequest::Ddl(SenderDdlRequest {
+                region_id,
+                sender: sender.into(),
+                request: DdlRequest::Truncate(v),
+            }),
+        };
+
+        Ok((worker_request, receiver))
     }
 }
 
-/// Request body of a region task.
-///
-/// It validates requests outside of workers.
+/// DDL request to a region.
 #[derive(Debug)]
-pub(crate) enum RequestBody {
-    Write(WriteRequest),
+pub(crate) enum DdlRequest {
     Create(RegionCreateRequest),
     Drop(RegionDropRequest),
     Open(RegionOpenRequest),
@@ -372,40 +548,146 @@ pub(crate) enum RequestBody {
     Alter(RegionAlterRequest),
     Flush(RegionFlushRequest),
     Compact(RegionCompactRequest),
+    Truncate(RegionTruncateRequest),
 }
 
-impl RequestBody {
-    /// Convert request body from [RegionRequest].
-    pub(crate) fn try_from_region_request(
-        region_id: RegionId,
-        value: RegionRequest,
-    ) -> Result<RequestBody> {
-        let body = match value {
-            RegionRequest::Put(v) => {
-                let write_request = WriteRequest::new(region_id, OpType::Put, v.rows)?;
-                RequestBody::Write(write_request)
-            }
-            RegionRequest::Delete(v) => {
-                let write_request = WriteRequest::new(region_id, OpType::Delete, v.rows)?;
-                RequestBody::Write(write_request)
-            }
-            RegionRequest::Create(v) => RequestBody::Create(v),
-            RegionRequest::Drop(v) => RequestBody::Drop(v),
-            RegionRequest::Open(v) => RequestBody::Open(v),
-            RegionRequest::Close(v) => RequestBody::Close(v),
-            RegionRequest::Alter(v) => RequestBody::Alter(v),
-            RegionRequest::Flush(v) => RequestBody::Flush(v),
-            RegionRequest::Compact(v) => RequestBody::Compact(v),
-        };
+/// Sender and Ddl request.
+#[derive(Debug)]
+pub(crate) struct SenderDdlRequest {
+    /// Region id of the request.
+    pub(crate) region_id: RegionId,
+    /// Result sender.
+    pub(crate) sender: OptionOutputTx,
+    /// Ddl request.
+    pub(crate) request: DdlRequest,
+}
 
-        Ok(body)
+/// Notification from a background job.
+#[derive(Debug)]
+pub(crate) enum BackgroundNotify {
+    /// Flush has finished.
+    FlushFinished(FlushFinished),
+    /// Flush has failed.
+    FlushFailed(FlushFailed),
+    /// Compaction has finished.
+    CompactionFinished(CompactionFinished),
+    /// Compaction has failed.
+    CompactionFailed(CompactionFailed),
+}
+
+/// Notifies a flush job is finished.
+#[derive(Debug)]
+pub(crate) struct FlushFinished {
+    /// Region id.
+    pub(crate) region_id: RegionId,
+    /// Meta of the flushed SSTs.
+    pub(crate) file_metas: Vec<FileMeta>,
+    /// Entry id of flushed data.
+    pub(crate) flushed_entry_id: EntryId,
+    /// Sequence of flushed data.
+    pub(crate) flushed_sequence: SequenceNumber,
+    /// Id of memtables to remove.
+    pub(crate) memtables_to_remove: SmallVec<[MemtableId; 2]>,
+    /// Flush result senders.
+    pub(crate) senders: Vec<OutputTx>,
+    /// File purger for cleaning files on failure.
+    pub(crate) file_purger: FilePurgerRef,
+}
+
+impl FlushFinished {
+    pub(crate) fn on_success(self) {
+        for sender in self.senders {
+            sender.send(Ok(Output::AffectedRows(0)));
+        }
     }
+}
+
+impl OnFailure for FlushFinished {
+    fn on_failure(&mut self, err: Error) {
+        let err = Arc::new(err);
+        for sender in self.senders.drain(..) {
+            sender.send(Err(err.clone()).context(FlushRegionSnafu {
+                region_id: self.region_id,
+            }));
+        }
+        // Clean flushed files.
+        for file in &self.file_metas {
+            self.file_purger.send_request(PurgeRequest {
+                region_id: file.region_id,
+                file_id: file.file_id,
+            });
+        }
+    }
+}
+
+/// Notifies a flush job is failed.
+#[derive(Debug)]
+pub(crate) struct FlushFailed {
+    /// The error source of the failure.
+    pub(crate) err: Arc<Error>,
+}
+
+/// Notifies a compaction job has finished.
+#[derive(Debug)]
+pub(crate) struct CompactionFinished {
+    /// Region id.
+    pub(crate) region_id: RegionId,
+    /// Compaction output files that are to be added to region version.
+    pub(crate) compaction_outputs: Vec<FileMeta>,
+    /// Compacted files that are to be removed from region version.
+    pub(crate) compacted_files: Vec<FileMeta>,
+    /// Compaction result senders.
+    pub(crate) senders: Vec<OutputTx>,
+    /// File purger for cleaning files on failure.
+    pub(crate) file_purger: FilePurgerRef,
+}
+
+impl CompactionFinished {
+    pub fn on_success(self) {
+        for sender in self.senders {
+            sender.send(Ok(AffectedRows(0)));
+        }
+        info!("Successfully compacted region: {}", self.region_id);
+    }
+}
+
+impl OnFailure for CompactionFinished {
+    /// Compaction succeeded but failed to update manifest or region's already been dropped,
+    /// clean compaction output files.
+    fn on_failure(&mut self, err: Error) {
+        let err = Arc::new(err);
+        for sender in self.senders.drain(..) {
+            sender.send(Err(err.clone()).context(CompactRegionSnafu {
+                region_id: self.region_id,
+            }));
+        }
+        for file in &self.compacted_files {
+            let file_id = file.file_id;
+            warn!(
+                "Cleaning region {} compaction output file: {}",
+                self.region_id, file_id
+            );
+            self.file_purger.send_request(PurgeRequest {
+                region_id: self.region_id,
+                file_id,
+            });
+        }
+    }
+}
+
+/// A failing compaction result.
+#[derive(Debug)]
+pub(crate) struct CompactionFailed {
+    pub(crate) region_id: RegionId,
+    /// The error source of the failure.
+    pub(crate) err: Arc<Error>,
 }
 
 #[cfg(test)]
 mod tests {
     use api::v1::{Row, SemanticType};
     use datatypes::prelude::ConcreteDataType;
+    use datatypes::schema::ColumnDefaultConstraint;
     use store_api::metadata::RegionMetadataBuilder;
 
     use super::*;
@@ -590,7 +872,7 @@ mod tests {
 
         let request = WriteRequest::new(RegionId::new(1, 1), OpType::Put, rows).unwrap();
         let err = request.check_schema(&metadata).unwrap_err();
-        check_invalid_request(&err, "column ts is not null");
+        check_invalid_request(&err, "column ts is not null but input has null");
     }
 
     #[test]
@@ -665,6 +947,116 @@ mod tests {
             ],
             rows: vec![Row {
                 values: vec![ts_ms_value(1), Value { value_data: None }],
+            }],
+        };
+        assert_eq!(expect_rows, request.rows);
+    }
+
+    fn region_metadata_for_delete() -> RegionMetadata {
+        let mut builder = RegionMetadataBuilder::new(RegionId::new(1, 1));
+        builder
+            .push_column_metadata(ColumnMetadata {
+                column_schema: datatypes::schema::ColumnSchema::new(
+                    "ts",
+                    ConcreteDataType::timestamp_millisecond_datatype(),
+                    false,
+                ),
+                semantic_type: SemanticType::Timestamp,
+                column_id: 1,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: datatypes::schema::ColumnSchema::new(
+                    "k0",
+                    ConcreteDataType::int64_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Tag,
+                column_id: 2,
+            })
+            .push_column_metadata(ColumnMetadata {
+                column_schema: datatypes::schema::ColumnSchema::new(
+                    "f0",
+                    ConcreteDataType::int64_datatype(),
+                    true,
+                ),
+                semantic_type: SemanticType::Field,
+                column_id: 3,
+            })
+            // Column is not nullable.
+            .push_column_metadata(ColumnMetadata {
+                column_schema: datatypes::schema::ColumnSchema::new(
+                    "f1",
+                    ConcreteDataType::int64_datatype(),
+                    false,
+                )
+                .with_default_constraint(Some(ColumnDefaultConstraint::Value(
+                    datatypes::value::Value::Int64(100),
+                )))
+                .unwrap(),
+                semantic_type: SemanticType::Field,
+                column_id: 4,
+            })
+            .primary_key(vec![2]);
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn test_fill_missing_for_delete() {
+        let rows = Rows {
+            schema: vec![new_column_schema(
+                "ts",
+                ColumnDataType::TimestampMillisecond,
+                SemanticType::Timestamp,
+            )],
+            rows: vec![Row {
+                values: vec![ts_ms_value(1)],
+            }],
+        };
+        let metadata = region_metadata_for_delete();
+
+        let mut request = WriteRequest::new(RegionId::new(1, 1), OpType::Delete, rows).unwrap();
+        let err = request.check_schema(&metadata).unwrap_err();
+        check_invalid_request(&err, "delete requests need column k0");
+        let err = request.fill_missing_columns(&metadata).unwrap_err();
+        check_invalid_request(&err, "delete requests need column k0");
+
+        let rows = Rows {
+            schema: vec![
+                new_column_schema("k0", ColumnDataType::Int64, SemanticType::Tag),
+                new_column_schema(
+                    "ts",
+                    ColumnDataType::TimestampMillisecond,
+                    SemanticType::Timestamp,
+                ),
+            ],
+            rows: vec![Row {
+                values: vec![i64_value(100), ts_ms_value(1)],
+            }],
+        };
+        let mut request = WriteRequest::new(RegionId::new(1, 1), OpType::Delete, rows).unwrap();
+        let err = request.check_schema(&metadata).unwrap_err();
+        assert!(err.is_fill_default());
+        request.fill_missing_columns(&metadata).unwrap();
+
+        let expect_rows = Rows {
+            schema: vec![
+                new_column_schema("k0", ColumnDataType::Int64, SemanticType::Tag),
+                new_column_schema(
+                    "ts",
+                    ColumnDataType::TimestampMillisecond,
+                    SemanticType::Timestamp,
+                ),
+                new_column_schema("f0", ColumnDataType::Int64, SemanticType::Field),
+                new_column_schema("f1", ColumnDataType::Int64, SemanticType::Field),
+            ],
+            // Column f1 is not nullable and we use 0 for padding.
+            rows: vec![Row {
+                values: vec![
+                    i64_value(100),
+                    ts_ms_value(1),
+                    Value { value_data: None },
+                    i64_value(0),
+                ],
             }],
         };
         assert_eq!(expect_rows, request.rows);

@@ -18,24 +18,27 @@ chrono.workspace = true
 client = { workspace = true, features = ["testing"] }
 common-base = { workspace = true }
 common-catalog = { workspace = true }
+common-config = { workspace = true }
 common-error = { workspace = true }
 common-grpc = { workspace = true }
-common-meta = { workspace = true }
+common-meta = { workspace = true, features = ["testing"] }
+common-procedure = { workspace = true }
 common-query = { workspace = true }
 common-recordbatch = { workspace = true }
 common-runtime = { workspace = true }
 common-telemetry = { workspace = true }
 common-test-util = { workspace = true }
-datanode = { workspace = true, features = ["testing"] }
+datanode = { workspace = true }
 datatypes = { workspace = true }
 dotenv = "0.15"
 frontend = { workspace = true, features = ["testing"] }
 futures.workspace = true
 meta-client = { workspace = true }
-meta-srv = { workspace = true }
+meta-srv = { workspace = true, features = ["mock"] }
 mito = { workspace = true, features = ["test"] }
 object-store = { workspace = true }
 once_cell.workspace = true
+operator = { workspace = true }
 query = { workspace = true }
 rand.workspace = true
 rstest = "0.17"
@@ -53,6 +56,7 @@ sqlx = { version = "0.6", features = [
     "postgres",
     "chrono",
 ] }
+substrait = { workspace = true }
 table = { workspace = true }
 tempfile.workspace = true
 tokio.workspace = true
@@ -61,7 +65,6 @@ tower = "0.4"
 uuid.workspace = true
 
 [dev-dependencies]
-common-procedure = { workspace = true }
 datafusion-expr.workspace = true
 datafusion.workspace = true
 itertools.workspace = true

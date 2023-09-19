@@ -14,13 +14,20 @@
 
 //! Utilities for testing.
 
+pub mod memtable_util;
+pub mod scheduler_util;
+pub mod version_util;
+
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use api::greptime_proto::v1;
+use api::helper::ColumnDataTypeWrapper;
 use api::v1::value::ValueData;
-use api::v1::{OpType, SemanticType};
+use api::v1::{OpType, Row, Rows, SemanticType};
 use common_datasource::compression::CompressionType;
+use common_query::Output;
 use common_test_util::temp_dir::{create_temp_dir, TempDir};
 use datatypes::arrow::array::{TimestampMillisecondArray, UInt64Array, UInt8Array};
 use datatypes::prelude::ConcreteDataType;
@@ -30,20 +37,40 @@ use log_store::test_util::log_store_util;
 use object_store::services::Fs;
 use object_store::ObjectStore;
 use store_api::metadata::{ColumnMetadata, RegionMetadataRef};
-use store_api::region_request::RegionCreateRequest;
+use store_api::region_engine::RegionEngine;
+use store_api::region_request::{
+    RegionCloseRequest, RegionCreateRequest, RegionDeleteRequest, RegionFlushRequest,
+    RegionOpenRequest, RegionPutRequest, RegionRequest,
+};
+use store_api::storage::RegionId;
 
 use crate::config::MitoConfig;
+use crate::engine::listener::EventListenerRef;
 use crate::engine::MitoEngine;
 use crate::error::Result;
+use crate::flush::{WriteBufferManager, WriteBufferManagerRef};
 use crate::manifest::manager::{RegionManifestManager, RegionManifestOptions};
 use crate::read::{Batch, BatchBuilder, BatchReader};
+use crate::sst::file_purger::{FilePurger, FilePurgerRef, PurgeRequest};
 use crate::worker::WorkerGroup;
+
+#[derive(Debug)]
+pub(crate) struct NoopFilePurger;
+
+impl FilePurger for NoopFilePurger {
+    fn send_request(&self, _request: PurgeRequest) {}
+}
+
+pub(crate) fn new_noop_file_purger() -> FilePurgerRef {
+    Arc::new(NoopFilePurger {})
+}
 
 /// Env to test mito engine.
 pub struct TestEnv {
     /// Path to store data.
     data_home: TempDir,
-    // TODO(yingwen): Maybe provide a way to close the log store.
+    logstore: Option<Arc<RaftEngineLogStore>>,
+    object_store: Option<ObjectStore>,
 }
 
 impl Default for TestEnv {
@@ -57,6 +84,8 @@ impl TestEnv {
     pub fn new() -> TestEnv {
         TestEnv {
             data_home: create_temp_dir(""),
+            logstore: None,
+            object_store: None,
         }
     }
 
@@ -64,14 +93,53 @@ impl TestEnv {
     pub fn with_prefix(prefix: &str) -> TestEnv {
         TestEnv {
             data_home: create_temp_dir(prefix),
+            logstore: None,
+            object_store: None,
         }
     }
 
+    pub fn get_logstore(&self) -> Option<Arc<RaftEngineLogStore>> {
+        self.logstore.clone()
+    }
+
+    pub fn get_object_store(&self) -> Option<ObjectStore> {
+        self.object_store.clone()
+    }
+
     /// Creates a new engine with specific config under this env.
-    pub async fn create_engine(&self, config: MitoConfig) -> MitoEngine {
+    pub async fn create_engine(&mut self, config: MitoConfig) -> MitoEngine {
         let (log_store, object_store) = self.create_log_and_object_store().await;
 
-        MitoEngine::new(config, Arc::new(log_store), object_store)
+        let logstore = Arc::new(log_store);
+        self.logstore = Some(logstore.clone());
+        self.object_store = Some(object_store.clone());
+        MitoEngine::new(config, logstore, object_store)
+    }
+
+    /// Creates a new engine with specific config and manager/listener under this env.
+    pub async fn create_engine_with(
+        &mut self,
+        config: MitoConfig,
+        manager: WriteBufferManagerRef,
+        listener: Option<EventListenerRef>,
+    ) -> MitoEngine {
+        let (log_store, object_store) = self.create_log_and_object_store().await;
+
+        let logstore = Arc::new(log_store);
+        self.logstore = Some(logstore.clone());
+        self.object_store = Some(object_store.clone());
+        MitoEngine::new_for_test(config, logstore, object_store, manager, listener)
+    }
+
+    /// Reopen the engine.
+    pub async fn reopen_engine(&mut self, engine: MitoEngine, config: MitoConfig) -> MitoEngine {
+        engine.stop().await.unwrap();
+
+        MitoEngine::new(
+            config,
+            self.logstore.clone().unwrap(),
+            self.object_store.clone().unwrap(),
+        )
     }
 
     /// Creates a new [WorkerGroup] with specific config under this env.
@@ -134,11 +202,14 @@ impl TestEnv {
 }
 
 /// Builder to mock a [RegionCreateRequest].
+///
+/// It builds schema like `[tag_0, tag_1, ..., field_0, field_1, ..., ts]`.
 pub struct CreateRequestBuilder {
     region_dir: String,
     tag_num: usize,
     field_num: usize,
     create_if_not_exists: bool,
+    options: HashMap<String, String>,
 }
 
 impl Default for CreateRequestBuilder {
@@ -148,6 +219,7 @@ impl Default for CreateRequestBuilder {
             tag_num: 1,
             field_num: 1,
             create_if_not_exists: false,
+            options: HashMap::new(),
         }
     }
 }
@@ -168,12 +240,17 @@ impl CreateRequestBuilder {
     }
 
     pub fn field_num(mut self, value: usize) -> Self {
-        self.tag_num = value;
+        self.field_num = value;
         self
     }
 
     pub fn create_if_not_exists(mut self, value: bool) -> Self {
         self.create_if_not_exists = value;
+        self
+    }
+
+    pub fn insert_option(mut self, key: &str, value: &str) -> Self {
+        self.options.insert(key.to_string(), value.to_string());
         self
     }
 
@@ -222,7 +299,7 @@ impl CreateRequestBuilder {
             column_metadatas,
             primary_key,
             create_if_not_exists: self.create_if_not_exists,
-            options: HashMap::default(),
+            options: self.options.clone(),
             region_dir: self.region_dir.clone(),
         }
     }
@@ -241,7 +318,7 @@ pub(crate) fn i64_value(data: i64) -> v1::Value {
 #[cfg(test)]
 pub(crate) fn ts_ms_value(data: i64) -> v1::Value {
     v1::Value {
-        value_data: Some(ValueData::TsMillisecondValue(data)),
+        value_data: Some(ValueData::TimestampMillisecondValue(data)),
     }
 }
 
@@ -312,4 +389,225 @@ pub fn new_batch(
     new_batch_builder(primary_key, timestamps, sequences, op_types, field)
         .build()
         .unwrap()
+}
+
+/// Ensure the reader returns batch as `expect`.
+pub async fn check_reader_result<R: BatchReader>(reader: &mut R, expect: &[Batch]) {
+    let mut result = Vec::new();
+    while let Some(batch) = reader.next_batch().await.unwrap() {
+        result.push(batch);
+    }
+
+    assert_eq!(expect, result);
+    // Next call to `next_batch()` still returns None.
+    assert!(reader.next_batch().await.unwrap().is_none());
+}
+
+/// A mock [WriteBufferManager] that supports controlling whether to flush/stall.
+#[derive(Debug, Default)]
+pub struct MockWriteBufferManager {
+    should_flush: AtomicBool,
+    should_stall: AtomicBool,
+    memory_used: AtomicUsize,
+    memory_active: AtomicUsize,
+}
+
+impl MockWriteBufferManager {
+    /// Set whether to flush the engine.
+    pub fn set_should_flush(&self, value: bool) {
+        self.should_flush.store(value, Ordering::Relaxed);
+    }
+
+    /// Set whether to stall the engine.
+    pub fn set_should_stall(&self, value: bool) {
+        self.should_stall.store(value, Ordering::Relaxed);
+    }
+
+    /// Returns memory usage of mutable memtables.
+    pub fn mutable_usage(&self) -> usize {
+        self.memory_active.load(Ordering::Relaxed)
+    }
+}
+
+impl WriteBufferManager for MockWriteBufferManager {
+    fn should_flush_engine(&self) -> bool {
+        self.should_flush.load(Ordering::Relaxed)
+    }
+
+    fn should_stall(&self) -> bool {
+        self.should_stall.load(Ordering::Relaxed)
+    }
+
+    fn reserve_mem(&self, mem: usize) {
+        self.memory_used.fetch_add(mem, Ordering::Relaxed);
+        self.memory_active.fetch_add(mem, Ordering::Relaxed);
+    }
+
+    fn schedule_free_mem(&self, mem: usize) {
+        self.memory_active.fetch_sub(mem, Ordering::Relaxed);
+    }
+
+    fn free_mem(&self, mem: usize) {
+        self.memory_used.fetch_sub(mem, Ordering::Relaxed);
+    }
+
+    fn memory_usage(&self) -> usize {
+        self.memory_used.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn column_metadata_to_column_schema(metadata: &ColumnMetadata) -> api::v1::ColumnSchema {
+    api::v1::ColumnSchema {
+        column_name: metadata.column_schema.name.clone(),
+        datatype: ColumnDataTypeWrapper::try_from(metadata.column_schema.data_type.clone())
+            .unwrap()
+            .datatype() as i32,
+        semantic_type: metadata.semantic_type as i32,
+    }
+}
+
+/// Build rows with schema (string, f64, ts_millis).
+pub fn build_rows(start: usize, end: usize) -> Vec<Row> {
+    (start..end)
+        .map(|i| api::v1::Row {
+            values: vec![
+                api::v1::Value {
+                    value_data: Some(ValueData::StringValue(i.to_string())),
+                },
+                api::v1::Value {
+                    value_data: Some(ValueData::F64Value(i as f64)),
+                },
+                api::v1::Value {
+                    value_data: Some(ValueData::TimestampMillisecondValue(i as i64 * 1000)),
+                },
+            ],
+        })
+        .collect()
+}
+
+/// Get column schemas for rows.
+pub fn rows_schema(request: &RegionCreateRequest) -> Vec<api::v1::ColumnSchema> {
+    request
+        .column_metadatas
+        .iter()
+        .map(column_metadata_to_column_schema)
+        .collect::<Vec<_>>()
+}
+
+/// Get column schemas for delete requests.
+pub fn delete_rows_schema(request: &RegionCreateRequest) -> Vec<api::v1::ColumnSchema> {
+    request
+        .column_metadatas
+        .iter()
+        .filter(|col| col.semantic_type != SemanticType::Field)
+        .map(column_metadata_to_column_schema)
+        .collect::<Vec<_>>()
+}
+
+/// Put rows into the engine.
+pub async fn put_rows(engine: &MitoEngine, region_id: RegionId, rows: Rows) {
+    let num_rows = rows.rows.len();
+    let output = engine
+        .handle_request(region_id, RegionRequest::Put(RegionPutRequest { rows }))
+        .await
+        .unwrap();
+    let Output::AffectedRows(rows_inserted) = output else {
+        unreachable!()
+    };
+    assert_eq!(num_rows, rows_inserted);
+}
+
+/// Build rows to put for specific `key`.
+pub fn build_rows_for_key(key: &str, start: usize, end: usize, value_start: usize) -> Vec<Row> {
+    (start..end)
+        .enumerate()
+        .map(|(idx, ts)| api::v1::Row {
+            values: vec![
+                api::v1::Value {
+                    value_data: Some(ValueData::StringValue(key.to_string())),
+                },
+                api::v1::Value {
+                    value_data: Some(ValueData::F64Value((value_start + idx) as f64)),
+                },
+                api::v1::Value {
+                    value_data: Some(ValueData::TimestampMillisecondValue(ts as i64 * 1000)),
+                },
+            ],
+        })
+        .collect()
+}
+
+/// Build rows to delete for specific `key`.
+pub fn build_delete_rows_for_key(key: &str, start: usize, end: usize) -> Vec<Row> {
+    (start..end)
+        .map(|ts| api::v1::Row {
+            values: vec![
+                api::v1::Value {
+                    value_data: Some(ValueData::StringValue(key.to_string())),
+                },
+                api::v1::Value {
+                    value_data: Some(ValueData::TimestampMillisecondValue(ts as i64 * 1000)),
+                },
+            ],
+        })
+        .collect()
+}
+
+/// Delete rows from the engine.
+pub async fn delete_rows(engine: &MitoEngine, region_id: RegionId, rows: Rows) {
+    let num_rows = rows.rows.len();
+    let output = engine
+        .handle_request(
+            region_id,
+            RegionRequest::Delete(RegionDeleteRequest { rows }),
+        )
+        .await
+        .unwrap();
+    let Output::AffectedRows(rows_inserted) = output else {
+        unreachable!()
+    };
+    assert_eq!(num_rows, rows_inserted);
+}
+
+/// Flush a region manually.
+pub async fn flush_region(engine: &MitoEngine, region_id: RegionId) {
+    let Output::AffectedRows(rows) = engine
+        .handle_request(region_id, RegionRequest::Flush(RegionFlushRequest {}))
+        .await
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(0, rows);
+}
+
+/// Reopen a region.
+pub async fn reopen_region(
+    engine: &MitoEngine,
+    region_id: RegionId,
+    region_dir: String,
+    writable: bool,
+) {
+    // Close the region.
+    engine
+        .handle_request(region_id, RegionRequest::Close(RegionCloseRequest {}))
+        .await
+        .unwrap();
+
+    // Open the region again.
+    engine
+        .handle_request(
+            region_id,
+            RegionRequest::Open(RegionOpenRequest {
+                engine: String::new(),
+                region_dir,
+                options: HashMap::default(),
+            }),
+        )
+        .await
+        .unwrap();
+
+    if writable {
+        engine.set_writable(region_id, true).unwrap();
+    }
 }

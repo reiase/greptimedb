@@ -20,13 +20,12 @@ use common_base::Plugins;
 use common_telemetry::logging;
 use frontend::frontend::FrontendOptions;
 use frontend::instance::{FrontendInstance, Instance as FeInstance};
-use frontend::service_config::InfluxdbOptions;
 use meta_client::MetaClientOptions;
 use servers::tls::{TlsMode, TlsOption};
 use servers::Mode;
 use snafu::ResultExt;
 
-use crate::error::{self, IllegalAuthConfigSnafu, Result, StartCatalogManagerSnafu};
+use crate::error::{self, IllegalAuthConfigSnafu, Result};
 use crate::options::{Options, TopLevelOptions};
 
 pub struct Instance {
@@ -35,12 +34,6 @@ pub struct Instance {
 
 impl Instance {
     pub async fn start(&mut self) -> Result<()> {
-        self.frontend
-            .catalog_manager()
-            .start()
-            .await
-            .context(StartCatalogManagerSnafu)?;
-
         self.frontend
             .start()
             .await
@@ -145,49 +138,40 @@ impl StartCommand {
         );
 
         if let Some(addr) = &self.http_addr {
-            if let Some(http_opts) = &mut opts.http_options {
-                http_opts.addr = addr.clone()
-            }
+            opts.http.addr = addr.clone()
         }
 
         if let Some(disable_dashboard) = self.disable_dashboard {
-            opts.http_options
-                .get_or_insert_with(Default::default)
-                .disable_dashboard = disable_dashboard;
+            opts.http.disable_dashboard = disable_dashboard;
         }
 
         if let Some(addr) = &self.grpc_addr {
-            if let Some(grpc_opts) = &mut opts.grpc_options {
-                grpc_opts.addr = addr.clone()
-            }
+            opts.grpc.addr = addr.clone()
         }
 
         if let Some(addr) = &self.mysql_addr {
-            if let Some(mysql_opts) = &mut opts.mysql_options {
-                mysql_opts.addr = addr.clone();
-                mysql_opts.tls = tls_opts.clone();
-            }
+            opts.mysql.enable = true;
+            opts.mysql.addr = addr.clone();
+            opts.mysql.tls = tls_opts.clone();
         }
 
         if let Some(addr) = &self.postgres_addr {
-            if let Some(postgres_opts) = &mut opts.postgres_options {
-                postgres_opts.addr = addr.clone();
-                postgres_opts.tls = tls_opts;
-            }
+            opts.postgres.enable = true;
+            opts.postgres.addr = addr.clone();
+            opts.postgres.tls = tls_opts;
         }
 
         if let Some(addr) = &self.opentsdb_addr {
-            if let Some(opentsdb_addr) = &mut opts.opentsdb_options {
-                opentsdb_addr.addr = addr.clone();
-            }
+            opts.opentsdb.enable = true;
+            opts.opentsdb.addr = addr.clone();
         }
 
         if let Some(enable) = self.influxdb_enable {
-            opts.influxdb_options = Some(InfluxdbOptions { enable });
+            opts.influxdb.enable = enable;
         }
 
         if let Some(metasrv_addrs) = &self.metasrv_addr {
-            opts.meta_client_options
+            opts.meta_client
                 .get_or_insert_with(MetaClientOptions::default)
                 .metasrv_addrs = metasrv_addrs.clone();
             opts.mode = Mode::Distributed;
@@ -255,40 +239,29 @@ mod tests {
             unreachable!()
         };
 
-        assert_eq!(opts.http_options.as_ref().unwrap().addr, "127.0.0.1:1234");
-        assert_eq!(
-            ReadableSize::mb(64),
-            opts.http_options.as_ref().unwrap().body_limit
-        );
-        assert_eq!(opts.mysql_options.as_ref().unwrap().addr, "127.0.0.1:5678");
-        assert_eq!(
-            opts.postgres_options.as_ref().unwrap().addr,
-            "127.0.0.1:5432"
-        );
-        assert_eq!(
-            opts.opentsdb_options.as_ref().unwrap().addr,
-            "127.0.0.1:4321"
-        );
+        assert_eq!(opts.http.addr, "127.0.0.1:1234");
+        assert_eq!(ReadableSize::mb(64), opts.http.body_limit);
+        assert_eq!(opts.mysql.addr, "127.0.0.1:5678");
+        assert_eq!(opts.postgres.addr, "127.0.0.1:5432");
+        assert_eq!(opts.opentsdb.addr, "127.0.0.1:4321");
 
         let default_opts = FrontendOptions::default();
+
+        assert_eq!(opts.grpc.addr, default_opts.grpc.addr);
+        assert!(opts.mysql.enable);
+        assert_eq!(opts.mysql.runtime_size, default_opts.mysql.runtime_size);
+        assert!(opts.postgres.enable);
         assert_eq!(
-            opts.grpc_options.unwrap().addr,
-            default_opts.grpc_options.unwrap().addr
+            opts.postgres.runtime_size,
+            default_opts.postgres.runtime_size
         );
+        assert!(opts.opentsdb.enable);
         assert_eq!(
-            opts.mysql_options.as_ref().unwrap().runtime_size,
-            default_opts.mysql_options.as_ref().unwrap().runtime_size
-        );
-        assert_eq!(
-            opts.postgres_options.as_ref().unwrap().runtime_size,
-            default_opts.postgres_options.as_ref().unwrap().runtime_size
-        );
-        assert_eq!(
-            opts.opentsdb_options.as_ref().unwrap().runtime_size,
-            default_opts.opentsdb_options.as_ref().unwrap().runtime_size
+            opts.opentsdb.runtime_size,
+            default_opts.opentsdb.runtime_size
         );
 
-        assert!(!opts.influxdb_options.unwrap().enable);
+        assert!(!opts.influxdb.enable);
     }
 
     #[test]
@@ -297,7 +270,7 @@ mod tests {
         let toml_str = r#"
             mode = "distributed"
 
-            [http_options]
+            [http]
             addr = "127.0.0.1:4000"
             timeout = "30s"
             body_limit = "2GB"
@@ -319,19 +292,10 @@ mod tests {
             unreachable!()
         };
         assert_eq!(Mode::Distributed, fe_opts.mode);
-        assert_eq!(
-            "127.0.0.1:4000".to_string(),
-            fe_opts.http_options.as_ref().unwrap().addr
-        );
-        assert_eq!(
-            Duration::from_secs(30),
-            fe_opts.http_options.as_ref().unwrap().timeout
-        );
+        assert_eq!("127.0.0.1:4000".to_string(), fe_opts.http.addr);
+        assert_eq!(Duration::from_secs(30), fe_opts.http.timeout);
 
-        assert_eq!(
-            ReadableSize::gb(2),
-            fe_opts.http_options.as_ref().unwrap().body_limit
-        );
+        assert_eq!(ReadableSize::gb(2), fe_opts.http.body_limit);
 
         assert_eq!("debug", fe_opts.logging.level.as_ref().unwrap());
         assert_eq!("/tmp/greptimedb/test/logs".to_string(), fe_opts.logging.dir);
@@ -382,15 +346,15 @@ mod tests {
         let toml_str = r#"
             mode = "distributed"
 
-            [http_options]
+            [http]
             addr = "127.0.0.1:4000"
 
-            [meta_client_options]
+            [meta_client]
             timeout_millis = 3000
             connect_timeout_millis = 5000
             tcp_nodelay = true
 
-            [mysql_options]
+            [mysql]
             addr = "127.0.0.1:4002"
         "#;
         write!(file, "{}", toml_str).unwrap();
@@ -399,20 +363,20 @@ mod tests {
         temp_env::with_vars(
             [
                 (
-                    // mysql_options.addr = 127.0.0.1:14002
+                    // mysql.addr = 127.0.0.1:14002
                     [
                         env_prefix.to_string(),
-                        "mysql_options".to_uppercase(),
+                        "mysql".to_uppercase(),
                         "addr".to_uppercase(),
                     ]
                     .join(ENV_VAR_SEP),
                     Some("127.0.0.1:14002"),
                 ),
                 (
-                    // mysql_options.runtime_size = 11
+                    // mysql.runtime_size = 11
                     [
                         env_prefix.to_string(),
-                        "mysql_options".to_uppercase(),
+                        "mysql".to_uppercase(),
                         "runtime_size".to_uppercase(),
                     ]
                     .join(ENV_VAR_SEP),
@@ -422,17 +386,17 @@ mod tests {
                     // http_options.addr = 127.0.0.1:24000
                     [
                         env_prefix.to_string(),
-                        "http_options".to_uppercase(),
+                        "http".to_uppercase(),
                         "addr".to_uppercase(),
                     ]
                     .join(ENV_VAR_SEP),
                     Some("127.0.0.1:24000"),
                 ),
                 (
-                    // meta_client_options.metasrv_addrs = 127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003
+                    // meta_client.metasrv_addrs = 127.0.0.1:3001,127.0.0.1:3002,127.0.0.1:3003
                     [
                         env_prefix.to_string(),
-                        "meta_client_options".to_uppercase(),
+                        "meta_client".to_uppercase(),
                         "metasrv_addrs".to_uppercase(),
                     ]
                     .join(ENV_VAR_SEP),
@@ -457,9 +421,9 @@ mod tests {
                 };
 
                 // Should be read from env, env > default values.
-                assert_eq!(fe_opts.mysql_options.as_ref().unwrap().runtime_size, 11);
+                assert_eq!(fe_opts.mysql.runtime_size, 11);
                 assert_eq!(
-                    fe_opts.meta_client_options.unwrap().metasrv_addrs,
+                    fe_opts.meta_client.unwrap().metasrv_addrs,
                     vec![
                         "127.0.0.1:3001".to_string(),
                         "127.0.0.1:3002".to_string(),
@@ -468,22 +432,13 @@ mod tests {
                 );
 
                 // Should be read from config file, config file > env > default values.
-                assert_eq!(
-                    fe_opts.mysql_options.as_ref().unwrap().addr,
-                    "127.0.0.1:4002"
-                );
+                assert_eq!(fe_opts.mysql.addr, "127.0.0.1:4002");
 
                 // Should be read from cli, cli > config file > env > default values.
-                assert_eq!(
-                    fe_opts.http_options.as_ref().unwrap().addr,
-                    "127.0.0.1:14000"
-                );
+                assert_eq!(fe_opts.http.addr, "127.0.0.1:14000");
 
                 // Should be default value.
-                assert_eq!(
-                    fe_opts.grpc_options.as_ref().unwrap().addr,
-                    GrpcOptions::default().addr
-                );
+                assert_eq!(fe_opts.grpc.addr, GrpcOptions::default().addr);
             },
         );
     }

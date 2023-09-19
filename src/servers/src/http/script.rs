@@ -15,9 +15,11 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use axum::extract::{Json, Query, RawBody, State};
+use common_catalog::consts::DEFAULT_CATALOG_NAME;
 use common_error::ext::ErrorExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use session::context::QueryContext;
 
 use crate::http::{ApiState, JsonResponse};
 

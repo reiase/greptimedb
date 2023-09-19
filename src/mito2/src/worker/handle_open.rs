@@ -18,14 +18,18 @@ use std::sync::Arc;
 
 use common_query::Output;
 use common_telemetry::info;
+use object_store::util::join_path;
+use snafu::ResultExt;
+use store_api::logstore::LogStore;
 use store_api::region_request::RegionOpenRequest;
 use store_api::storage::RegionId;
 
-use crate::error::Result;
+use crate::error::{OpenDalSnafu, RegionNotFoundSnafu, Result};
 use crate::region::opener::RegionOpener;
-use crate::worker::RegionWorkerLoop;
+use crate::worker::handle_drop::remove_region_dir_once;
+use crate::worker::{RegionWorkerLoop, DROPPING_MARKER_FILE};
 
-impl<S> RegionWorkerLoop<S> {
+impl<S: LogStore> RegionWorkerLoop<S> {
     pub(crate) async fn handle_open_request(
         &mut self,
         region_id: RegionId,
@@ -35,6 +39,19 @@ impl<S> RegionWorkerLoop<S> {
             return Ok(Output::AffectedRows(0));
         }
 
+        // Check if this region is pending drop. And clean the entire dir if so.
+        if !self.dropping_regions.is_region_exists(region_id)
+            && self
+                .object_store
+                .is_exist(&join_path(&request.region_dir, DROPPING_MARKER_FILE))
+                .await
+                .context(OpenDalSnafu)?
+        {
+            let result = remove_region_dir_once(&request.region_dir, &self.object_store).await;
+            info!("Region {} is dropped, result: {:?}", region_id, result);
+            return RegionNotFoundSnafu { region_id }.fail();
+        }
+
         info!("Try to open region {}", region_id);
 
         // Open region from specific region dir.
@@ -42,9 +59,11 @@ impl<S> RegionWorkerLoop<S> {
             region_id,
             self.memtable_builder.clone(),
             self.object_store.clone(),
+            self.scheduler.clone(),
         )
         .region_dir(&request.region_dir)
-        .open(&self.config)
+        .options(request.options)
+        .open(&self.config, &self.wal)
         .await?;
 
         info!("Region {} is opened", region_id);

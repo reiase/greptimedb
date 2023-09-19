@@ -2,18 +2,21 @@ CREATE TABLE system_metrics (
   id INT UNSIGNED,
   host STRING,
   cpu DOUBLE,
-  disk FLOAT,
-  n INT COMMENT 'range key',
+  disk FLOAT COMMENT 'comment',
   ts TIMESTAMP NOT NULL DEFAULT current_timestamp(),
   TIME INDEX (ts),
   PRIMARY KEY (id, host)
 )
-PARTITION BY RANGE COLUMNS (n) (
+PARTITION BY RANGE COLUMNS (id) (
     PARTITION r0 VALUES LESS THAN (5),
     PARTITION r1 VALUES LESS THAN (9),
     PARTITION r2 VALUES LESS THAN (MAXVALUE),
 )
-ENGINE=mito;
+ENGINE=mito
+WITH(
+  ttl = '7d',
+  write_buffer_size = 1024
+);
 
 Affected Rows: 0
 
@@ -26,20 +29,21 @@ SHOW CREATE TABLE system_metrics;
 |                |   "id" INT UNSIGNED NULL,                                 |
 |                |   "host" STRING NULL,                                     |
 |                |   "cpu" DOUBLE NULL,                                      |
-|                |   "disk" FLOAT NULL,                                      |
-|                |   "n" INT NULL,                                           |
+|                |   "disk" FLOAT NULL COMMENT 'comment',                    |
 |                |   "ts" TIMESTAMP(3) NOT NULL DEFAULT current_timestamp(), |
 |                |   TIME INDEX ("ts"),                                      |
 |                |   PRIMARY KEY ("id", "host")                              |
 |                | )                                                         |
-|                | PARTITION BY RANGE COLUMNS ("n") (                        |
-|                |                       PARTITION r0 VALUES LESS THAN (5),  |
+|                | PARTITION BY RANGE COLUMNS ("id") (                       |
+|                |   PARTITION r0 VALUES LESS THAN (5),                      |
 |                |   PARTITION r1 VALUES LESS THAN (9),                      |
 |                |   PARTITION r2 VALUES LESS THAN (MAXVALUE)                |
-|                |                 )                                         |
+|                | )                                                         |
 |                | ENGINE=mito                                               |
 |                | WITH(                                                     |
-|                |   regions = 3                                             |
+|                |   regions = 3,                                            |
+|                |   ttl = '7days',                                          |
+|                |   write_buffer_size = '1.0KiB'                            |
 |                | )                                                         |
 +----------------+-----------------------------------------------------------+
 
@@ -72,4 +76,27 @@ show create table table_without_partition;
 drop table table_without_partition;
 
 Affected Rows: 1
+
+CREATE TABLE not_supported_table_options_keys (
+  id INT UNSIGNED,
+  host STRING,
+  cpu DOUBLE,
+  disk FLOAT,
+  ts TIMESTAMP NOT NULL DEFAULT current_timestamp(),
+  TIME INDEX (ts),
+  PRIMARY KEY (id, host)
+)
+PARTITION BY RANGE COLUMNS (id) (
+    PARTITION r0 VALUES LESS THAN (5),
+    PARTITION r1 VALUES LESS THAN (9),
+    PARTITION r2 VALUES LESS THAN (MAXVALUE),
+)
+ENGINE=mito
+WITH(
+  foo = 123,
+  ttl = '7d',
+  write_buffer_size = 1024
+);
+
+Error: 1004(InvalidArguments), Invalid table option key: foo
 

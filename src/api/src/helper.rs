@@ -18,33 +18,32 @@ use common_base::BitVec;
 use common_time::interval::IntervalUnit;
 use common_time::time::Time;
 use common_time::timestamp::TimeUnit;
-use common_time::{Date, DateTime, Interval, Timestamp};
+use common_time::{Date, DateTime, Duration, Interval, Timestamp};
 use datatypes::prelude::{ConcreteDataType, ValueRef};
 use datatypes::scalars::ScalarVector;
 use datatypes::types::{
-    Int16Type, Int8Type, IntervalType, TimeType, TimestampType, UInt16Type, UInt8Type,
+    DurationType, Int16Type, Int8Type, IntervalType, TimeType, TimestampType, UInt16Type, UInt8Type,
 };
 use datatypes::value::{OrderedF32, OrderedF64, Value};
 use datatypes::vectors::{
-    BinaryVector, BooleanVector, DateTimeVector, DateVector, Float32Vector, Float64Vector,
-    Int32Vector, Int64Vector, IntervalDayTimeVector, IntervalMonthDayNanoVector,
+    BinaryVector, BooleanVector, DateTimeVector, DateVector, DurationMicrosecondVector,
+    DurationMillisecondVector, DurationNanosecondVector, DurationSecondVector, Float32Vector,
+    Float64Vector, Int32Vector, Int64Vector, IntervalDayTimeVector, IntervalMonthDayNanoVector,
     IntervalYearMonthVector, PrimitiveVector, StringVector, TimeMicrosecondVector,
     TimeMillisecondVector, TimeNanosecondVector, TimeSecondVector, TimestampMicrosecondVector,
     TimestampMillisecondVector, TimestampNanosecondVector, TimestampSecondVector, UInt32Vector,
     UInt64Vector, VectorRef,
 };
-use greptime_proto::v1;
 use greptime_proto::v1::ddl_request::Expr;
 use greptime_proto::v1::greptime_request::Request;
 use greptime_proto::v1::query_request::Query;
-use greptime_proto::v1::region::region_request;
 use greptime_proto::v1::value::ValueData;
-use greptime_proto::v1::{DdlRequest, IntervalMonthDayNano, QueryRequest, SemanticType};
+use greptime_proto::v1::{self, DdlRequest, IntervalMonthDayNano, QueryRequest, Row, SemanticType};
 use snafu::prelude::*;
 
 use crate::error::{self, Result};
 use crate::v1::column::Values;
-use crate::v1::{Column, ColumnDataType};
+use crate::v1::{Column, ColumnDataType, Value as GrpcValue};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ColumnDataTypeWrapper(ColumnDataType);
@@ -54,6 +53,10 @@ impl ColumnDataTypeWrapper {
         let datatype = ColumnDataType::from_i32(datatype)
             .context(error::UnknownColumnDataTypeSnafu { datatype })?;
         Ok(Self(datatype))
+    }
+
+    pub fn new(datatype: ColumnDataType) -> Self {
+        Self(datatype)
     }
 
     pub fn datatype(&self) -> ColumnDataType {
@@ -98,6 +101,14 @@ impl From<ColumnDataTypeWrapper> for ConcreteDataType {
             ColumnDataType::IntervalMonthDayNano => {
                 ConcreteDataType::interval_month_day_nano_datatype()
             }
+            ColumnDataType::DurationSecond => ConcreteDataType::duration_second_datatype(),
+            ColumnDataType::DurationMillisecond => {
+                ConcreteDataType::duration_millisecond_datatype()
+            }
+            ColumnDataType::DurationMicrosecond => {
+                ConcreteDataType::duration_microsecond_datatype()
+            }
+            ColumnDataType::DurationNanosecond => ConcreteDataType::duration_nanosecond_datatype(),
         }
     }
 }
@@ -138,6 +149,12 @@ impl TryFrom<ConcreteDataType> for ColumnDataTypeWrapper {
                 IntervalType::YearMonth(_) => ColumnDataType::IntervalYearMonth,
                 IntervalType::DayTime(_) => ColumnDataType::IntervalDayTime,
                 IntervalType::MonthDayNano(_) => ColumnDataType::IntervalMonthDayNano,
+            },
+            ConcreteDataType::Duration(d) => match d {
+                DurationType::Second(_) => ColumnDataType::DurationSecond,
+                DurationType::Millisecond(_) => ColumnDataType::DurationMillisecond,
+                DurationType::Microsecond(_) => ColumnDataType::DurationMicrosecond,
+                DurationType::Nanosecond(_) => ColumnDataType::DurationNanosecond,
             },
             ConcreteDataType::Null(_)
             | ConcreteDataType::List(_)
@@ -212,19 +229,19 @@ pub fn values_with_capacity(datatype: ColumnDataType, capacity: usize) -> Values
             ..Default::default()
         },
         ColumnDataType::TimestampSecond => Values {
-            ts_second_values: Vec::with_capacity(capacity),
+            timestamp_second_values: Vec::with_capacity(capacity),
             ..Default::default()
         },
         ColumnDataType::TimestampMillisecond => Values {
-            ts_millisecond_values: Vec::with_capacity(capacity),
+            timestamp_millisecond_values: Vec::with_capacity(capacity),
             ..Default::default()
         },
         ColumnDataType::TimestampMicrosecond => Values {
-            ts_microsecond_values: Vec::with_capacity(capacity),
+            timestamp_microsecond_values: Vec::with_capacity(capacity),
             ..Default::default()
         },
         ColumnDataType::TimestampNanosecond => Values {
-            ts_nanosecond_values: Vec::with_capacity(capacity),
+            timestamp_nanosecond_values: Vec::with_capacity(capacity),
             ..Default::default()
         },
         ColumnDataType::TimeSecond => Values {
@@ -253,6 +270,22 @@ pub fn values_with_capacity(datatype: ColumnDataType, capacity: usize) -> Values
         },
         ColumnDataType::IntervalMonthDayNano => Values {
             interval_month_day_nano_values: Vec::with_capacity(capacity),
+            ..Default::default()
+        },
+        ColumnDataType::DurationSecond => Values {
+            duration_second_values: Vec::with_capacity(capacity),
+            ..Default::default()
+        },
+        ColumnDataType::DurationMillisecond => Values {
+            duration_millisecond_values: Vec::with_capacity(capacity),
+            ..Default::default()
+        },
+        ColumnDataType::DurationMicrosecond => Values {
+            duration_microsecond_values: Vec::with_capacity(capacity),
+            ..Default::default()
+        },
+        ColumnDataType::DurationNanosecond => Values {
+            duration_nanosecond_values: Vec::with_capacity(capacity),
             ..Default::default()
         },
     }
@@ -284,10 +317,10 @@ pub fn push_vals(column: &mut Column, origin_count: usize, vector: VectorRef) {
         Value::Date(val) => values.date_values.push(val.val()),
         Value::DateTime(val) => values.datetime_values.push(val.val()),
         Value::Timestamp(val) => match val.unit() {
-            TimeUnit::Second => values.ts_second_values.push(val.value()),
-            TimeUnit::Millisecond => values.ts_millisecond_values.push(val.value()),
-            TimeUnit::Microsecond => values.ts_microsecond_values.push(val.value()),
-            TimeUnit::Nanosecond => values.ts_nanosecond_values.push(val.value()),
+            TimeUnit::Second => values.timestamp_second_values.push(val.value()),
+            TimeUnit::Millisecond => values.timestamp_millisecond_values.push(val.value()),
+            TimeUnit::Microsecond => values.timestamp_microsecond_values.push(val.value()),
+            TimeUnit::Nanosecond => values.timestamp_nanosecond_values.push(val.value()),
         },
         Value::Time(val) => match val.unit() {
             TimeUnit::Second => values.time_second_values.push(val.value()),
@@ -301,6 +334,12 @@ pub fn push_vals(column: &mut Column, origin_count: usize, vector: VectorRef) {
             IntervalUnit::MonthDayNano => values
                 .interval_month_day_nano_values
                 .push(convert_i128_to_interval(val.to_i128())),
+        },
+        Value::Duration(val) => match val.unit() {
+            TimeUnit::Second => values.duration_second_values.push(val.value()),
+            TimeUnit::Millisecond => values.duration_millisecond_values.push(val.value()),
+            TimeUnit::Microsecond => values.duration_microsecond_values.push(val.value()),
+            TimeUnit::Nanosecond => values.duration_nanosecond_values.push(val.value()),
         },
         Value::List(_) => unreachable!(),
     });
@@ -329,21 +368,6 @@ fn query_request_type(request: &QueryRequest) -> &'static str {
     }
 }
 
-/// Returns the type name of the [RegionRequest].
-pub fn region_request_type(request: &region_request::Request) -> &'static str {
-    match request {
-        region_request::Request::Inserts(_) => "region.inserts",
-        region_request::Request::Deletes(_) => "region.deletes",
-        region_request::Request::Create(_) => "region.create",
-        region_request::Request::Drop(_) => "region.drop  ",
-        region_request::Request::Open(_) => "region.open",
-        region_request::Request::Close(_) => "region.close",
-        region_request::Request::Alter(_) => "region.alter",
-        region_request::Request::Flush(_) => "region.flush",
-        region_request::Request::Compact(_) => "region.compact",
-    }
-}
-
 /// Returns the type name of the [DdlRequest].
 fn ddl_request_type(request: &DdlRequest) -> &'static str {
     match request.expr {
@@ -351,8 +375,6 @@ fn ddl_request_type(request: &DdlRequest) -> &'static str {
         Some(Expr::CreateTable(_)) => "ddl.create_table",
         Some(Expr::Alter(_)) => "ddl.alter",
         Some(Expr::DropTable(_)) => "ddl.drop_table",
-        Some(Expr::FlushTable(_)) => "ddl.flush_table",
-        Some(Expr::CompactTable(_)) => "ddl.compact_table",
         Some(Expr::TruncateTable(_)) => "ddl.truncate_table",
         None => "ddl.empty",
     }
@@ -390,10 +412,16 @@ pub fn pb_value_to_value_ref(value: &v1::Value) -> ValueRef {
         ValueData::StringValue(string) => ValueRef::String(string.as_str()),
         ValueData::DateValue(d) => ValueRef::Date(Date::from(*d)),
         ValueData::DatetimeValue(d) => ValueRef::DateTime(DateTime::new(*d)),
-        ValueData::TsSecondValue(t) => ValueRef::Timestamp(Timestamp::new_second(*t)),
-        ValueData::TsMillisecondValue(t) => ValueRef::Timestamp(Timestamp::new_millisecond(*t)),
-        ValueData::TsMicrosecondValue(t) => ValueRef::Timestamp(Timestamp::new_microsecond(*t)),
-        ValueData::TsNanosecondValue(t) => ValueRef::Timestamp(Timestamp::new_nanosecond(*t)),
+        ValueData::TimestampSecondValue(t) => ValueRef::Timestamp(Timestamp::new_second(*t)),
+        ValueData::TimestampMillisecondValue(t) => {
+            ValueRef::Timestamp(Timestamp::new_millisecond(*t))
+        }
+        ValueData::TimestampMicrosecondValue(t) => {
+            ValueRef::Timestamp(Timestamp::new_microsecond(*t))
+        }
+        ValueData::TimestampNanosecondValue(t) => {
+            ValueRef::Timestamp(Timestamp::new_nanosecond(*t))
+        }
         ValueData::TimeSecondValue(t) => ValueRef::Time(Time::new_second(*t)),
         ValueData::TimeMillisecondValue(t) => ValueRef::Time(Time::new_millisecond(*t)),
         ValueData::TimeMicrosecondValue(t) => ValueRef::Time(Time::new_microsecond(*t)),
@@ -404,6 +432,10 @@ pub fn pb_value_to_value_ref(value: &v1::Value) -> ValueRef {
             let interval = Interval::from_month_day_nano(v.months, v.days, v.nanoseconds);
             ValueRef::Interval(interval)
         }
+        ValueData::DurationSecondValue(v) => ValueRef::Duration(Duration::new_second(*v)),
+        ValueData::DurationMillisecondValue(v) => ValueRef::Duration(Duration::new_millisecond(*v)),
+        ValueData::DurationMicrosecondValue(v) => ValueRef::Duration(Duration::new_microsecond(*v)),
+        ValueData::DurationNanosecondValue(v) => ValueRef::Duration(Duration::new_nanosecond(*v)),
     }
 }
 
@@ -433,17 +465,17 @@ pub fn pb_values_to_vector_ref(data_type: &ConcreteDataType, values: Values) -> 
         ConcreteDataType::Date(_) => Arc::new(DateVector::from_vec(values.date_values)),
         ConcreteDataType::DateTime(_) => Arc::new(DateTimeVector::from_vec(values.datetime_values)),
         ConcreteDataType::Timestamp(unit) => match unit {
-            TimestampType::Second(_) => {
-                Arc::new(TimestampSecondVector::from_vec(values.ts_second_values))
-            }
+            TimestampType::Second(_) => Arc::new(TimestampSecondVector::from_vec(
+                values.timestamp_second_values,
+            )),
             TimestampType::Millisecond(_) => Arc::new(TimestampMillisecondVector::from_vec(
-                values.ts_millisecond_values,
+                values.timestamp_millisecond_values,
             )),
             TimestampType::Microsecond(_) => Arc::new(TimestampMicrosecondVector::from_vec(
-                values.ts_microsecond_values,
+                values.timestamp_microsecond_values,
             )),
             TimestampType::Nanosecond(_) => Arc::new(TimestampNanosecondVector::from_vec(
-                values.ts_nanosecond_values,
+                values.timestamp_nanosecond_values,
             )),
         },
         ConcreteDataType::Time(unit) => match unit {
@@ -475,6 +507,20 @@ pub fn pb_values_to_vector_ref(data_type: &ConcreteDataType, values: Values) -> 
                     }),
                 ))
             }
+        },
+        ConcreteDataType::Duration(unit) => match unit {
+            DurationType::Second(_) => Arc::new(DurationSecondVector::from_vec(
+                values.duration_second_values,
+            )),
+            DurationType::Millisecond(_) => Arc::new(DurationMillisecondVector::from_vec(
+                values.duration_millisecond_values,
+            )),
+            DurationType::Microsecond(_) => Arc::new(DurationMicrosecondVector::from_vec(
+                values.duration_microsecond_values,
+            )),
+            DurationType::Nanosecond(_) => Arc::new(DurationNanosecondVector::from_vec(
+                values.duration_nanosecond_values,
+            )),
         },
         ConcreteDataType::Null(_) | ConcreteDataType::List(_) | ConcreteDataType::Dictionary(_) => {
             unreachable!()
@@ -565,22 +611,22 @@ pub fn pb_values_to_values(data_type: &ConcreteDataType, values: Values) -> Vec<
             .map(|v| Value::Date(v.into()))
             .collect(),
         ConcreteDataType::Timestamp(TimestampType::Second(_)) => values
-            .ts_second_values
+            .timestamp_second_values
             .into_iter()
             .map(|v| Value::Timestamp(Timestamp::new_second(v)))
             .collect(),
         ConcreteDataType::Timestamp(TimestampType::Millisecond(_)) => values
-            .ts_millisecond_values
+            .timestamp_millisecond_values
             .into_iter()
             .map(|v| Value::Timestamp(Timestamp::new_millisecond(v)))
             .collect(),
         ConcreteDataType::Timestamp(TimestampType::Microsecond(_)) => values
-            .ts_microsecond_values
+            .timestamp_microsecond_values
             .into_iter()
             .map(|v| Value::Timestamp(Timestamp::new_microsecond(v)))
             .collect(),
         ConcreteDataType::Timestamp(TimestampType::Nanosecond(_)) => values
-            .ts_nanosecond_values
+            .timestamp_nanosecond_values
             .into_iter()
             .map(|v| Value::Timestamp(Timestamp::new_nanosecond(v)))
             .collect(),
@@ -625,6 +671,26 @@ pub fn pb_values_to_values(data_type: &ConcreteDataType, values: Values) -> Vec<
                     v.nanoseconds,
                 ))
             })
+            .collect(),
+        ConcreteDataType::Duration(DurationType::Second(_)) => values
+            .duration_second_values
+            .into_iter()
+            .map(|v| Value::Duration(Duration::new_second(v)))
+            .collect(),
+        ConcreteDataType::Duration(DurationType::Millisecond(_)) => values
+            .duration_millisecond_values
+            .into_iter()
+            .map(|v| Value::Duration(Duration::new_millisecond(v)))
+            .collect(),
+        ConcreteDataType::Duration(DurationType::Microsecond(_)) => values
+            .duration_microsecond_values
+            .into_iter()
+            .map(|v| Value::Duration(Duration::new_microsecond(v)))
+            .collect(),
+        ConcreteDataType::Duration(DurationType::Nanosecond(_)) => values
+            .duration_nanosecond_values
+            .into_iter()
+            .map(|v| Value::Duration(Duration::new_nanosecond(v)))
             .collect(),
         ConcreteDataType::Null(_) | ConcreteDataType::List(_) | ConcreteDataType::Dictionary(_) => {
             unreachable!()
@@ -697,16 +763,16 @@ pub fn to_proto_value(value: Value) -> Option<v1::Value> {
         },
         Value::Timestamp(v) => match v.unit() {
             TimeUnit::Second => v1::Value {
-                value_data: Some(ValueData::TsSecondValue(v.value())),
+                value_data: Some(ValueData::TimestampSecondValue(v.value())),
             },
             TimeUnit::Millisecond => v1::Value {
-                value_data: Some(ValueData::TsMillisecondValue(v.value())),
+                value_data: Some(ValueData::TimestampMillisecondValue(v.value())),
             },
             TimeUnit::Microsecond => v1::Value {
-                value_data: Some(ValueData::TsMicrosecondValue(v.value())),
+                value_data: Some(ValueData::TimestampMicrosecondValue(v.value())),
             },
             TimeUnit::Nanosecond => v1::Value {
-                value_data: Some(ValueData::TsNanosecondValue(v.value())),
+                value_data: Some(ValueData::TimestampNanosecondValue(v.value())),
             },
         },
         Value::Time(v) => match v.unit() {
@@ -736,6 +802,20 @@ pub fn to_proto_value(value: Value) -> Option<v1::Value> {
                 )),
             },
         },
+        Value::Duration(v) => match v.unit() {
+            TimeUnit::Second => v1::Value {
+                value_data: Some(ValueData::DurationSecondValue(v.value())),
+            },
+            TimeUnit::Millisecond => v1::Value {
+                value_data: Some(ValueData::DurationMillisecondValue(v.value())),
+            },
+            TimeUnit::Microsecond => v1::Value {
+                value_data: Some(ValueData::DurationMicrosecondValue(v.value())),
+            },
+            TimeUnit::Nanosecond => v1::Value {
+                value_data: Some(ValueData::DurationNanosecondValue(v.value())),
+            },
+        },
         Value::List(_) => return None,
     };
 
@@ -762,10 +842,10 @@ pub fn proto_value_type(value: &v1::Value) -> Option<ColumnDataType> {
         ValueData::StringValue(_) => ColumnDataType::String,
         ValueData::DateValue(_) => ColumnDataType::Date,
         ValueData::DatetimeValue(_) => ColumnDataType::Datetime,
-        ValueData::TsSecondValue(_) => ColumnDataType::TimestampSecond,
-        ValueData::TsMillisecondValue(_) => ColumnDataType::TimestampMillisecond,
-        ValueData::TsMicrosecondValue(_) => ColumnDataType::TimestampMicrosecond,
-        ValueData::TsNanosecondValue(_) => ColumnDataType::TimestampNanosecond,
+        ValueData::TimestampSecondValue(_) => ColumnDataType::TimestampSecond,
+        ValueData::TimestampMillisecondValue(_) => ColumnDataType::TimestampMillisecond,
+        ValueData::TimestampMicrosecondValue(_) => ColumnDataType::TimestampMicrosecond,
+        ValueData::TimestampNanosecondValue(_) => ColumnDataType::TimestampNanosecond,
         ValueData::TimeSecondValue(_) => ColumnDataType::TimeSecond,
         ValueData::TimeMillisecondValue(_) => ColumnDataType::TimeMillisecond,
         ValueData::TimeMicrosecondValue(_) => ColumnDataType::TimeMicrosecond,
@@ -773,6 +853,10 @@ pub fn proto_value_type(value: &v1::Value) -> Option<ColumnDataType> {
         ValueData::IntervalYearMonthValues(_) => ColumnDataType::IntervalYearMonth,
         ValueData::IntervalDayTimeValues(_) => ColumnDataType::IntervalDayTime,
         ValueData::IntervalMonthDayNanoValues(_) => ColumnDataType::IntervalMonthDayNano,
+        ValueData::DurationSecondValue(_) => ColumnDataType::DurationSecond,
+        ValueData::DurationMillisecondValue(_) => ColumnDataType::DurationMillisecond,
+        ValueData::DurationMicrosecondValue(_) => ColumnDataType::DurationMicrosecond,
+        ValueData::DurationNanosecondValue(_) => ColumnDataType::DurationNanosecond,
     };
     Some(value_type)
 }
@@ -809,13 +893,90 @@ pub fn to_column_data_type(data_type: &ConcreteDataType) -> Option<ColumnDataTyp
         ConcreteDataType::Time(TimeType::Millisecond(_)) => ColumnDataType::TimeMillisecond,
         ConcreteDataType::Time(TimeType::Microsecond(_)) => ColumnDataType::TimeMicrosecond,
         ConcreteDataType::Time(TimeType::Nanosecond(_)) => ColumnDataType::TimeNanosecond,
-        ConcreteDataType::Null(_)
-        | ConcreteDataType::Interval(_)
-        | ConcreteDataType::List(_)
-        | ConcreteDataType::Dictionary(_) => return None,
+        ConcreteDataType::Duration(DurationType::Second(_)) => ColumnDataType::DurationSecond,
+        ConcreteDataType::Duration(DurationType::Millisecond(_)) => {
+            ColumnDataType::DurationMillisecond
+        }
+        ConcreteDataType::Duration(DurationType::Microsecond(_)) => {
+            ColumnDataType::DurationMicrosecond
+        }
+        ConcreteDataType::Duration(DurationType::Nanosecond(_)) => {
+            ColumnDataType::DurationNanosecond
+        }
+        ConcreteDataType::Interval(IntervalType::YearMonth(_)) => ColumnDataType::IntervalYearMonth,
+        ConcreteDataType::Interval(IntervalType::MonthDayNano(_)) => {
+            ColumnDataType::IntervalMonthDayNano
+        }
+        ConcreteDataType::Interval(IntervalType::DayTime(_)) => ColumnDataType::IntervalDayTime,
+        ConcreteDataType::Null(_) | ConcreteDataType::List(_) | ConcreteDataType::Dictionary(_) => {
+            return None
+        }
     };
 
     Some(column_data_type)
+}
+
+pub fn vectors_to_rows<'a>(
+    columns: impl Iterator<Item = &'a VectorRef>,
+    row_count: usize,
+) -> Vec<Row> {
+    let mut rows = vec![Row { values: vec![] }; row_count];
+    for column in columns {
+        for (row_index, row) in rows.iter_mut().enumerate() {
+            row.values.push(value_to_grpc_value(column.get(row_index)))
+        }
+    }
+
+    rows
+}
+
+pub fn value_to_grpc_value(value: Value) -> GrpcValue {
+    GrpcValue {
+        value_data: match value {
+            Value::Null => None,
+            Value::Boolean(v) => Some(ValueData::BoolValue(v)),
+            Value::UInt8(v) => Some(ValueData::U8Value(v as _)),
+            Value::UInt16(v) => Some(ValueData::U16Value(v as _)),
+            Value::UInt32(v) => Some(ValueData::U32Value(v)),
+            Value::UInt64(v) => Some(ValueData::U64Value(v)),
+            Value::Int8(v) => Some(ValueData::I8Value(v as _)),
+            Value::Int16(v) => Some(ValueData::I16Value(v as _)),
+            Value::Int32(v) => Some(ValueData::I32Value(v)),
+            Value::Int64(v) => Some(ValueData::I64Value(v)),
+            Value::Float32(v) => Some(ValueData::F32Value(*v)),
+            Value::Float64(v) => Some(ValueData::F64Value(*v)),
+            Value::String(v) => Some(ValueData::StringValue(v.as_utf8().to_string())),
+            Value::Binary(v) => Some(ValueData::BinaryValue(v.to_vec())),
+            Value::Date(v) => Some(ValueData::DateValue(v.val())),
+            Value::DateTime(v) => Some(ValueData::DatetimeValue(v.val())),
+            Value::Timestamp(v) => Some(match v.unit() {
+                TimeUnit::Second => ValueData::TimestampSecondValue(v.value()),
+                TimeUnit::Millisecond => ValueData::TimestampMillisecondValue(v.value()),
+                TimeUnit::Microsecond => ValueData::TimestampMicrosecondValue(v.value()),
+                TimeUnit::Nanosecond => ValueData::TimestampNanosecondValue(v.value()),
+            }),
+            Value::Time(v) => Some(match v.unit() {
+                TimeUnit::Second => ValueData::TimeSecondValue(v.value()),
+                TimeUnit::Millisecond => ValueData::TimeMillisecondValue(v.value()),
+                TimeUnit::Microsecond => ValueData::TimeMicrosecondValue(v.value()),
+                TimeUnit::Nanosecond => ValueData::TimeNanosecondValue(v.value()),
+            }),
+            Value::Interval(v) => Some(match v.unit() {
+                IntervalUnit::YearMonth => ValueData::IntervalYearMonthValues(v.to_i32()),
+                IntervalUnit::DayTime => ValueData::IntervalDayTimeValues(v.to_i64()),
+                IntervalUnit::MonthDayNano => {
+                    ValueData::IntervalMonthDayNanoValues(convert_i128_to_interval(v.to_i128()))
+                }
+            }),
+            Value::Duration(v) => Some(match v.unit() {
+                TimeUnit::Second => ValueData::DurationSecondValue(v.value()),
+                TimeUnit::Millisecond => ValueData::DurationMillisecondValue(v.value()),
+                TimeUnit::Microsecond => ValueData::DurationMicrosecondValue(v.value()),
+                TimeUnit::Nanosecond => ValueData::DurationNanosecondValue(v.value()),
+            }),
+            Value::List(_) => unreachable!(),
+        },
+    }
 }
 
 /// Returns true if the column type is equal to expected type.
@@ -832,14 +993,16 @@ mod tests {
     use std::sync::Arc;
 
     use datatypes::types::{
-        IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType, TimeMillisecondType,
-        TimeSecondType, TimestampMillisecondType, TimestampSecondType,
+        DurationMillisecondType, DurationSecondType, Int32Type, IntervalDayTimeType,
+        IntervalMonthDayNanoType, IntervalYearMonthType, TimeMillisecondType, TimeSecondType,
+        TimestampMillisecondType, TimestampSecondType, UInt32Type,
     };
     use datatypes::vectors::{
-        BooleanVector, IntervalDayTimeVector, IntervalMonthDayNanoVector, IntervalYearMonthVector,
-        TimeMicrosecondVector, TimeMillisecondVector, TimeNanosecondVector, TimeSecondVector,
-        TimestampMicrosecondVector, TimestampMillisecondVector, TimestampNanosecondVector,
-        TimestampSecondVector, Vector,
+        BooleanVector, DurationMicrosecondVector, DurationMillisecondVector,
+        DurationNanosecondVector, DurationSecondVector, IntervalDayTimeVector,
+        IntervalMonthDayNanoVector, IntervalYearMonthVector, TimeMicrosecondVector,
+        TimeMillisecondVector, TimeNanosecondVector, TimeSecondVector, TimestampMicrosecondVector,
+        TimestampMillisecondVector, TimestampNanosecondVector, TimestampSecondVector, Vector,
     };
     use paste::paste;
 
@@ -900,7 +1063,7 @@ mod tests {
         assert_eq!(2, values.capacity());
 
         let values = values_with_capacity(ColumnDataType::TimestampMillisecond, 2);
-        let values = values.ts_millisecond_values;
+        let values = values.timestamp_millisecond_values;
         assert_eq!(2, values.capacity());
 
         let values = values_with_capacity(ColumnDataType::TimeMillisecond, 2);
@@ -913,6 +1076,10 @@ mod tests {
 
         let values = values_with_capacity(ColumnDataType::IntervalMonthDayNano, 2);
         let values = values.interval_month_day_nano_values;
+        assert_eq!(2, values.capacity());
+
+        let values = values_with_capacity(ColumnDataType::DurationMillisecond, 2);
+        let values = values.duration_millisecond_values;
         assert_eq!(2, values.capacity());
     }
 
@@ -998,6 +1165,10 @@ mod tests {
             ConcreteDataType::interval_datatype(IntervalUnit::MonthDayNano),
             ColumnDataTypeWrapper(ColumnDataType::IntervalMonthDayNano).into()
         );
+        assert_eq!(
+            ConcreteDataType::duration_millisecond_datatype(),
+            ColumnDataTypeWrapper(ColumnDataType::DurationMillisecond).into()
+        )
     }
 
     #[test]
@@ -1086,6 +1257,12 @@ mod tests {
                 .try_into()
                 .unwrap()
         );
+        assert_eq!(
+            ColumnDataTypeWrapper(ColumnDataType::DurationMillisecond),
+            ConcreteDataType::duration_millisecond_datatype()
+                .try_into()
+                .unwrap()
+        );
 
         let result: Result<ColumnDataTypeWrapper> = ConcreteDataType::null_datatype().try_into();
         assert!(result.is_err());
@@ -1119,28 +1296,28 @@ mod tests {
         push_vals(&mut column, 3, vector);
         assert_eq!(
             vec![1, 2, 3],
-            column.values.as_ref().unwrap().ts_nanosecond_values
+            column.values.as_ref().unwrap().timestamp_nanosecond_values
         );
 
         let vector = Arc::new(TimestampMillisecondVector::from_vec(vec![4, 5, 6]));
         push_vals(&mut column, 3, vector);
         assert_eq!(
             vec![4, 5, 6],
-            column.values.as_ref().unwrap().ts_millisecond_values
+            column.values.as_ref().unwrap().timestamp_millisecond_values
         );
 
         let vector = Arc::new(TimestampMicrosecondVector::from_vec(vec![7, 8, 9]));
         push_vals(&mut column, 3, vector);
         assert_eq!(
             vec![7, 8, 9],
-            column.values.as_ref().unwrap().ts_microsecond_values
+            column.values.as_ref().unwrap().timestamp_microsecond_values
         );
 
         let vector = Arc::new(TimestampSecondVector::from_vec(vec![10, 11, 12]));
         push_vals(&mut column, 3, vector);
         assert_eq!(
             vec![10, 11, 12],
-            column.values.as_ref().unwrap().ts_second_values
+            column.values.as_ref().unwrap().timestamp_second_values
         );
     }
 
@@ -1230,6 +1407,47 @@ mod tests {
     }
 
     #[test]
+    fn test_column_put_duration_values() {
+        let mut column = Column {
+            column_name: "test".to_string(),
+            semantic_type: 0,
+            values: Some(Values {
+                ..Default::default()
+            }),
+            null_mask: vec![],
+            datatype: 0,
+        };
+
+        let vector = Arc::new(DurationNanosecondVector::from_vec(vec![1, 2, 3]));
+        push_vals(&mut column, 3, vector);
+        assert_eq!(
+            vec![1, 2, 3],
+            column.values.as_ref().unwrap().duration_nanosecond_values
+        );
+
+        let vector = Arc::new(DurationMicrosecondVector::from_vec(vec![7, 8, 9]));
+        push_vals(&mut column, 3, vector);
+        assert_eq!(
+            vec![7, 8, 9],
+            column.values.as_ref().unwrap().duration_microsecond_values
+        );
+
+        let vector = Arc::new(DurationMillisecondVector::from_vec(vec![4, 5, 6]));
+        push_vals(&mut column, 3, vector);
+        assert_eq!(
+            vec![4, 5, 6],
+            column.values.as_ref().unwrap().duration_millisecond_values
+        );
+
+        let vector = Arc::new(DurationSecondVector::from_vec(vec![10, 11, 12]));
+        push_vals(&mut column, 3, vector);
+        assert_eq!(
+            vec![10, 11, 12],
+            column.values.as_ref().unwrap().duration_second_values
+        );
+    }
+
+    #[test]
     fn test_column_put_vector() {
         use crate::v1::SemanticType;
         // Some(false), None, Some(true), Some(true)
@@ -1269,7 +1487,7 @@ mod tests {
         let actual = pb_values_to_values(
             &ConcreteDataType::Timestamp(TimestampType::Second(TimestampSecondType)),
             Values {
-                ts_second_values: vec![1_i64, 2_i64, 3_i64],
+                timestamp_second_values: vec![1_i64, 2_i64, 3_i64],
                 ..Default::default()
             },
         );
@@ -1284,7 +1502,7 @@ mod tests {
         let actual = pb_values_to_values(
             &ConcreteDataType::Timestamp(TimestampType::Millisecond(TimestampMillisecondType)),
             Values {
-                ts_millisecond_values: vec![1_i64, 2_i64, 3_i64],
+                timestamp_millisecond_values: vec![1_i64, 2_i64, 3_i64],
                 ..Default::default()
             },
         );
@@ -1325,6 +1543,39 @@ mod tests {
             Value::Time(Time::new_millisecond(1_i64)),
             Value::Time(Time::new_millisecond(2_i64)),
             Value::Time(Time::new_millisecond(3_i64)),
+        ];
+        assert_eq!(expect, actual);
+    }
+
+    #[test]
+    fn test_convert_duration_values() {
+        // second
+        let actual = pb_values_to_values(
+            &ConcreteDataType::Duration(DurationType::Second(DurationSecondType)),
+            Values {
+                duration_second_values: vec![1_i64, 2_i64, 3_i64],
+                ..Default::default()
+            },
+        );
+        let expect = vec![
+            Value::Duration(Duration::new_second(1_i64)),
+            Value::Duration(Duration::new_second(2_i64)),
+            Value::Duration(Duration::new_second(3_i64)),
+        ];
+        assert_eq!(expect, actual);
+
+        // millisecond
+        let actual = pb_values_to_values(
+            &ConcreteDataType::Duration(DurationType::Millisecond(DurationMillisecondType)),
+            Values {
+                duration_millisecond_values: vec![1_i64, 2_i64, 3_i64],
+                ..Default::default()
+            },
+        );
+        let expect = vec![
+            Value::Duration(Duration::new_millisecond(1_i64)),
+            Value::Duration(Duration::new_millisecond(2_i64)),
+            Value::Duration(Duration::new_millisecond(3_i64)),
         ];
         assert_eq!(expect, actual);
     }
@@ -1536,4 +1787,76 @@ mod tests {
             Value::DateTime(3.into())
         ]
     );
+
+    #[test]
+    fn test_vectors_to_rows_for_different_types() {
+        let boolean_vec = BooleanVector::from_vec(vec![true, false, true]);
+        let int8_vec = PrimitiveVector::<Int8Type>::from_iter_values(vec![1, 2, 3]);
+        let int32_vec = PrimitiveVector::<Int32Type>::from_iter_values(vec![100, 200, 300]);
+        let uint8_vec = PrimitiveVector::<UInt8Type>::from_iter_values(vec![10, 20, 30]);
+        let uint32_vec = PrimitiveVector::<UInt32Type>::from_iter_values(vec![1000, 2000, 3000]);
+        let float32_vec = Float32Vector::from_vec(vec![1.1, 2.2, 3.3]);
+        let date_vec = DateVector::from_vec(vec![10, 20, 30]);
+        let string_vec = StringVector::from_vec(vec!["a", "b", "c"]);
+
+        let vector_refs: Vec<VectorRef> = vec![
+            Arc::new(boolean_vec),
+            Arc::new(int8_vec),
+            Arc::new(int32_vec),
+            Arc::new(uint8_vec),
+            Arc::new(uint32_vec),
+            Arc::new(float32_vec),
+            Arc::new(date_vec),
+            Arc::new(string_vec),
+        ];
+
+        let result = vectors_to_rows(vector_refs.iter(), 3);
+
+        assert_eq!(result.len(), 3);
+
+        assert_eq!(result[0].values.len(), 8);
+        let values = result[0]
+            .values
+            .iter()
+            .map(|v| v.value_data.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values[0], ValueData::BoolValue(true));
+        assert_eq!(values[1], ValueData::I8Value(1));
+        assert_eq!(values[2], ValueData::I32Value(100));
+        assert_eq!(values[3], ValueData::U8Value(10));
+        assert_eq!(values[4], ValueData::U32Value(1000));
+        assert_eq!(values[5], ValueData::F32Value(1.1));
+        assert_eq!(values[6], ValueData::DateValue(10));
+        assert_eq!(values[7], ValueData::StringValue("a".to_string()));
+
+        assert_eq!(result[1].values.len(), 8);
+        let values = result[1]
+            .values
+            .iter()
+            .map(|v| v.value_data.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values[0], ValueData::BoolValue(false));
+        assert_eq!(values[1], ValueData::I8Value(2));
+        assert_eq!(values[2], ValueData::I32Value(200));
+        assert_eq!(values[3], ValueData::U8Value(20));
+        assert_eq!(values[4], ValueData::U32Value(2000));
+        assert_eq!(values[5], ValueData::F32Value(2.2));
+        assert_eq!(values[6], ValueData::DateValue(20));
+        assert_eq!(values[7], ValueData::StringValue("b".to_string()));
+
+        assert_eq!(result[2].values.len(), 8);
+        let values = result[2]
+            .values
+            .iter()
+            .map(|v| v.value_data.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(values[0], ValueData::BoolValue(true));
+        assert_eq!(values[1], ValueData::I8Value(3));
+        assert_eq!(values[2], ValueData::I32Value(300));
+        assert_eq!(values[3], ValueData::U8Value(30));
+        assert_eq!(values[4], ValueData::U32Value(3000));
+        assert_eq!(values[5], ValueData::F32Value(3.3));
+        assert_eq!(values[6], ValueData::DateValue(30));
+        assert_eq!(values[7], ValueData::StringValue("c".to_string()));
+    }
 }

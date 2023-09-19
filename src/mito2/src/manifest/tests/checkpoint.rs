@@ -57,6 +57,7 @@ fn nop_action() -> RegionMetaActionList {
         files_to_add: vec![],
         files_to_remove: vec![],
         compaction_time_window: None,
+        flushed_entry_id: None,
         flushed_sequence: None,
     })])
 }
@@ -66,7 +67,7 @@ async fn manager_without_checkpoint() {
     let (_env, manager) = build_manager(0, CompressionType::Uncompressed).await;
 
     // apply 10 actions
-    for i in 0..10 {
+    for _ in 0..10 {
         manager.update(nop_action()).await.unwrap();
     }
 
@@ -110,7 +111,7 @@ async fn manager_with_checkpoint_distance_1() {
     let (env, manager) = build_manager(1, CompressionType::Uncompressed).await;
 
     // apply 10 actions
-    for i in 0..10 {
+    for _ in 0..10 {
         manager.update(nop_action()).await.unwrap();
     }
 
@@ -149,7 +150,7 @@ async fn manager_with_checkpoint_distance_1() {
         .await
         .unwrap();
     let raw_json = std::str::from_utf8(&raw_bytes).unwrap();
-    let expected_json = "{\"size\":729,\"version\":9,\"checksum\":null,\"extend_metadata\":{}}";
+    let expected_json = "{\"size\":816,\"version\":9,\"checksum\":null,\"extend_metadata\":{}}";
     assert_eq!(expected_json, raw_json);
 
     // reopen the manager
@@ -175,6 +176,7 @@ async fn checkpoint_with_different_compression_types() {
             files_to_add: vec![file_meta],
             files_to_remove: vec![],
             compaction_time_window: None,
+            flushed_entry_id: None,
             flushed_sequence: None,
         })]);
         actions.push(action);
@@ -194,7 +196,7 @@ async fn generate_checkpoint_with_compression_types(
     compress_type: CompressionType,
     actions: Vec<RegionMetaActionList>,
 ) -> RegionCheckpoint {
-    let (env, manager) = build_manager(1, CompressionType::Uncompressed).await;
+    let (_env, manager) = build_manager(1, compress_type).await;
 
     for action in actions {
         manager.update(action).await.unwrap();

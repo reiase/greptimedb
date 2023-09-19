@@ -65,12 +65,7 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[snafu(display(
-        "Failed to execute query, source: {}, query: {}, location: {}",
-        source,
-        query,
-        location
-    ))]
+    #[snafu(display("Failed to execute query, source: {}, query: {}", source, query))]
     ExecuteQuery {
         query: String,
         location: Location,
@@ -85,6 +80,12 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     ExecuteGrpcQuery {
+        location: Location,
+        source: BoxedError,
+    },
+
+    #[snafu(display("{source}"))]
+    ExecuteGrpcRequest {
         location: Location,
         source: BoxedError,
     },
@@ -261,7 +262,7 @@ pub enum Error {
         source: query::error::Error,
     },
 
-    #[snafu(display("Failed to get param types, source: {source}, location: {location}"))]
+    #[snafu(display("Failed to get param types, source: {source}"))]
     GetPreparedStmtParams {
         source: query::error::Error,
         location: Location,
@@ -362,6 +363,7 @@ impl ErrorExt for Error {
             | ExecuteQuery { source, .. }
             | ExecutePlan { source, .. }
             | ExecuteGrpcQuery { source, .. }
+            | ExecuteGrpcRequest { source, .. }
             | CheckDatabaseValidity { source, .. } => source.status_code(),
 
             NotSupported { .. }
@@ -444,8 +446,11 @@ pub fn status_to_tonic_code(status_code: StatusCode) -> Code {
         | StatusCode::EngineExecuteQuery => Code::Internal,
         StatusCode::InvalidArguments | StatusCode::InvalidSyntax => Code::InvalidArgument,
         StatusCode::Cancelled => Code::Cancelled,
-        StatusCode::TableAlreadyExists | StatusCode::TableColumnExists => Code::AlreadyExists,
+        StatusCode::TableAlreadyExists
+        | StatusCode::TableColumnExists
+        | StatusCode::RegionAlreadyExists => Code::AlreadyExists,
         StatusCode::TableNotFound
+        | StatusCode::RegionNotFound
         | StatusCode::TableColumnNotFound
         | StatusCode::DatabaseNotFound
         | StatusCode::UserNotFound => Code::NotFound,
@@ -455,7 +460,9 @@ pub fn status_to_tonic_code(status_code: StatusCode) -> Code {
         | StatusCode::UserPasswordMismatch
         | StatusCode::AuthHeaderNotFound
         | StatusCode::InvalidAuthHeader => Code::Unauthenticated,
-        StatusCode::AccessDenied | StatusCode::PermissionDenied => Code::PermissionDenied,
+        StatusCode::AccessDenied | StatusCode::PermissionDenied | StatusCode::RegionReadonly => {
+            Code::PermissionDenied
+        }
     }
 }
 

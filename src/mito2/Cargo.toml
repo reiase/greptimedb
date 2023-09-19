@@ -11,8 +11,8 @@ test = ["common-test-util"]
 [dependencies]
 anymap = "1.0.0-beta.2"
 api.workspace = true
-aquamarine = "0.3"
-arc-swap = "1.0"
+aquamarine.workspace = true
+async-channel = "1.9"
 async-compat = "0.2"
 async-stream.workspace = true
 async-trait = "0.1"
@@ -31,12 +31,12 @@ common-test-util = { workspace = true, optional = true }
 common-time = { workspace = true }
 dashmap = "5.4"
 datafusion-common.workspace = true
+datafusion-expr.workspace = true
 datafusion.workspace = true
 datatypes = { workspace = true }
-flume = "0.10"
 futures.workspace = true
+humantime-serde = { workspace = true }
 lazy_static = "1.4"
-log-store = { workspace = true }
 memcomparable = "0.2"
 metrics.workspace = true
 object-store = { workspace = true }
@@ -45,11 +45,12 @@ paste.workspace = true
 prost.workspace = true
 regex = "1.5"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json.workspace = true
+serde_with = "3"
+smallvec.workspace = true
 snafu.workspace = true
-storage = { workspace = true }
 store-api = { workspace = true }
-strum = "0.21"
+strum.workspace = true
 table = { workspace = true }
 tokio-util.workspace = true
 tokio.workspace = true
@@ -58,3 +59,4 @@ uuid.workspace = true
 [dev-dependencies]
 common-procedure-test = { workspace = true }
 common-test-util = { workspace = true }
+log-store = { workspace = true }

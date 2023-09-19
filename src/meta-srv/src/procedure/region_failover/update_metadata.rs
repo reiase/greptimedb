@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use common_meta::key::table_route::NextTableRouteKey;
+use common_meta::key::table_route::TableRouteKey;
 use common_meta::peer::Peer;
 use common_meta::rpc::router::RegionRoute;
 use common_meta::RegionIdent;
@@ -23,18 +23,22 @@ use snafu::{OptionExt, ResultExt};
 
 use super::invalidate_cache::InvalidateCache;
 use super::{RegionFailoverContext, State};
-use crate::error::{self, Result, RetryLaterSnafu};
+use crate::error::{self, Result, RetryLaterSnafu, TableRouteNotFoundSnafu};
 use crate::lock::keys::table_metadata_lock_key;
 use crate::lock::Opts;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub(super) struct UpdateRegionMetadata {
     candidate: Peer,
+    region_storage_path: String,
 }
 
 impl UpdateRegionMetadata {
-    pub(super) fn new(candidate: Peer) -> Self {
-        Self { candidate }
+    pub(super) fn new(candidate: Peer, region_storage_path: String) -> Self {
+        Self {
+            candidate,
+            region_storage_path,
+        }
     }
 
     /// Updates the metadata of the table.
@@ -57,7 +61,8 @@ impl UpdateRegionMetadata {
         ctx: &RegionFailoverContext,
         failed_region: &RegionIdent,
     ) -> Result<()> {
-        let table_id = failed_region.table_ident.table_id;
+        let table_id = failed_region.table_id;
+        let engine = &failed_region.engine;
 
         let table_route_value = ctx
             .table_metadata_manager
@@ -65,27 +70,31 @@ impl UpdateRegionMetadata {
             .get(table_id)
             .await
             .context(error::TableMetadataManagerSnafu)?
-            .with_context(|| error::TableRouteNotFoundSnafu {
-                table_name: failed_region.table_ident.table_ref().to_string(),
-            })?;
+            .context(TableRouteNotFoundSnafu { table_id })?;
 
         let mut new_region_routes = table_route_value.region_routes.clone();
 
         for region_route in new_region_routes.iter_mut() {
-            if region_route.region.id == failed_region.region_number as u64 {
+            if region_route.region.id.region_number() == failed_region.region_number {
                 region_route.leader_peer = Some(self.candidate.clone());
                 break;
             }
         }
 
         pretty_log_table_route_change(
-            NextTableRouteKey::new(table_id).to_string(),
+            TableRouteKey::new(table_id).to_string(),
             &new_region_routes,
             failed_region,
         );
 
         ctx.table_metadata_manager
-            .update_table_route(table_id, table_route_value, new_region_routes)
+            .update_table_route(
+                table_id,
+                engine,
+                &self.region_storage_path,
+                table_route_value,
+                new_region_routes,
+            )
             .await
             .context(error::UpdateTableRouteSnafu)?;
 
@@ -131,7 +140,7 @@ fn pretty_log_table_route_change(
 #[typetag::serde]
 impl State for UpdateRegionMetadata {
     async fn next(
-        mut self: Box<Self>,
+        &mut self,
         ctx: &RegionFailoverContext,
         failed_region: &RegionIdent,
     ) -> Result<Box<dyn State>> {
@@ -158,19 +167,16 @@ mod tests {
 
     use super::super::tests::{TestingEnv, TestingEnvBuilder};
     use super::{State, *};
-    use crate::table_routes::tests::new_region_route;
+    use crate::test_util::new_region_route;
 
     #[tokio::test]
     async fn test_next_state() {
         let env = TestingEnvBuilder::new().build().await;
         let failed_region = env.failed_region(1).await;
 
-        let state = UpdateRegionMetadata::new(Peer::new(2, ""));
+        let mut state = UpdateRegionMetadata::new(Peer::new(2, ""), env.path.clone());
 
-        let next_state = Box::new(state)
-            .next(&env.context, &failed_region)
-            .await
-            .unwrap();
+        let next_state = state.next(&env.context, &failed_region).await.unwrap();
         assert_eq!(format!("{next_state:?}"), "InvalidateCache");
     }
 
@@ -181,13 +187,13 @@ mod tests {
         async fn test(env: TestingEnv, failed_region: u32, candidate: u64) -> Vec<RegionRoute> {
             let failed_region = env.failed_region(failed_region).await;
 
-            let state = UpdateRegionMetadata::new(Peer::new(candidate, ""));
+            let state = UpdateRegionMetadata::new(Peer::new(candidate, ""), env.path.clone());
             state
                 .update_table_route(&env.context, &failed_region)
                 .await
                 .unwrap();
 
-            let table_id = failed_region.table_ident.table_id;
+            let table_id = failed_region.table_id;
 
             env.context
                 .table_metadata_manager
@@ -318,18 +324,18 @@ mod tests {
             let failed_region_1 = env.failed_region(1).await;
             let failed_region_2 = env.failed_region(2).await;
 
-            let table_id = failed_region_1.table_ident.table_id;
-
+            let table_id = failed_region_1.table_id;
+            let path = env.path.clone();
             let _ = futures::future::join_all(vec![
                 tokio::spawn(async move {
-                    let state = UpdateRegionMetadata::new(Peer::new(2, ""));
+                    let state = UpdateRegionMetadata::new(Peer::new(2, ""), path);
                     state
                         .update_metadata(&ctx_1, &failed_region_1)
                         .await
                         .unwrap();
                 }),
                 tokio::spawn(async move {
-                    let state = UpdateRegionMetadata::new(Peer::new(3, ""));
+                    let state = UpdateRegionMetadata::new(Peer::new(3, ""), env.path.clone());
                     state
                         .update_metadata(&ctx_2, &failed_region_2)
                         .await

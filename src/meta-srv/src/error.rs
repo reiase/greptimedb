@@ -18,6 +18,7 @@ use common_meta::peer::Peer;
 use common_runtime::JoinError;
 use servers::define_into_tonic_status;
 use snafu::{Location, Snafu};
+use table::metadata::TableId;
 use tokio::sync::mpsc::error::SendError;
 use tonic::codegen::http;
 
@@ -26,6 +27,37 @@ use crate::pubsub::Message;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
+    #[snafu(display("Failed to create default catalog and schema, source: {}", source))]
+    InitMetadata {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to allocate next sequence number: {}", source))]
+    NextSequence {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to submit ddl task: {}", source))]
+    SubmitDdlTask {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to invalidate table cache: {}", source))]
+    InvalidateTableCache {
+        location: Location,
+        source: common_meta::error::Error,
+    },
+
+    #[snafu(display("Failed to operate region on peer:{}, source: {}", peer, source))]
+    OperateRegion {
+        location: Location,
+        peer: Peer,
+        source: BoxedError,
+    },
+
     #[snafu(display("Failed to list catalogs: {}", source))]
     ListCatalogs {
         location: Location,
@@ -43,35 +75,6 @@ pub enum Error {
     Join {
         location: Location,
         source: JoinError,
-    },
-
-    #[snafu(display("Failed to convert grpc expr, source: {}", source))]
-    ConvertGrpcExpr {
-        location: Location,
-        source: common_grpc_expr::error::Error,
-    },
-
-    #[snafu(display(
-        "Failed to build table meta for table: {}, source: {}",
-        table_name,
-        source
-    ))]
-    BuildTableMeta {
-        table_name: String,
-        source: table::metadata::TableMetaBuilderError,
-        location: Location,
-    },
-
-    #[snafu(display("Table occurs error, source: {}", source))]
-    Table {
-        location: Location,
-        source: table::error::Error,
-    },
-
-    #[snafu(display("Failed to convert RawTableInfo into TableInfo: {}", source))]
-    ConvertRawTableInfo {
-        location: Location,
-        source: datatypes::Error,
     },
 
     #[snafu(display("Failed to execute transaction: {}", msg))]
@@ -166,6 +169,9 @@ pub enum Error {
     #[snafu(display("Invalid datanode stat key: {}", key))]
     InvalidStatKey { key: String, location: Location },
 
+    #[snafu(display("Invalid inactive region key: {}", key))]
+    InvalidInactiveRegionKey { key: String, location: Location },
+
     #[snafu(display("Failed to parse datanode lease key from utf8: {}", source))]
     LeaseKeyFromUtf8 {
         source: std::string::FromUtf8Error,
@@ -186,6 +192,12 @@ pub enum Error {
 
     #[snafu(display("Failed to parse datanode stat value from utf8: {}", source))]
     StatValueFromUtf8 {
+        source: std::string::FromUtf8Error,
+        location: Location,
+    },
+
+    #[snafu(display("Failed to parse invalid region key from utf8: {}", source))]
+    InvalidRegionKeyFromUtf8 {
         source: std::string::FromUtf8Error,
         location: Location,
     },
@@ -223,8 +235,11 @@ pub enum Error {
         source: common_catalog::error::Error,
     },
 
-    #[snafu(display("Unexpected sequence value: {}", err_msg))]
-    UnexpectedSequenceValue { err_msg: String, location: Location },
+    #[snafu(display("Cannot parse full table name, source: {}", source))]
+    InvalidFullTableName {
+        location: Location,
+        source: common_catalog::error::Error,
+    },
 
     #[snafu(display("Failed to decode table route, source: {}", source))]
     DecodeTableRoute {
@@ -232,15 +247,15 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Table route not found: {}", table_name))]
+    #[snafu(display("Failed to find table route for {table_id}, at {location}"))]
     TableRouteNotFound {
-        table_name: String,
+        table_id: TableId,
         location: Location,
     },
 
-    #[snafu(display("Table info not found: {}", table_name))]
+    #[snafu(display("Table info not found: {}", table_id))]
     TableInfoNotFound {
-        table_name: String,
+        table_id: TableId,
         location: Location,
     },
 
@@ -248,17 +263,6 @@ pub enum Error {
     CorruptedTableRoute {
         key: String,
         reason: String,
-        location: Location,
-    },
-
-    #[snafu(display("Failed to get sequence: {}", err_msg))]
-    NextSequence { err_msg: String, location: Location },
-
-    #[snafu(display("Sequence out of range: {}, start={}, step={}", name, start, step))]
-    SequenceOutOfRange {
-        name: String,
-        start: u64,
-        step: u64,
         location: Location,
     },
 
@@ -280,7 +284,7 @@ pub enum Error {
         location: Location,
     },
 
-    #[snafu(display("Unexpected, violated: {}", violated))]
+    #[snafu(display("Unexpected, violated: {violated}, at {location}"))]
     Unexpected {
         violated: String,
         location: Location,
@@ -555,7 +559,6 @@ impl ErrorExt for Error {
             | Error::StartGrpc { .. }
             | Error::UpdateTableMetadata { .. }
             | Error::NoEnoughAvailableDatanode { .. }
-            | Error::ConvertGrpcExpr { .. }
             | Error::PublishMessage { .. }
             | Error::Join { .. }
             | Error::Unsupported { .. } => StatusCode::Internal,
@@ -566,6 +569,7 @@ impl ErrorExt for Error {
             | Error::EmptyTableName { .. }
             | Error::InvalidLeaseKey { .. }
             | Error::InvalidStatKey { .. }
+            | Error::InvalidInactiveRegionKey { .. }
             | Error::ParseNum { .. }
             | Error::UnsupportedSelectorType { .. }
             | Error::InvalidArguments { .. }
@@ -575,25 +579,22 @@ impl ErrorExt for Error {
             | Error::LeaseValueFromUtf8 { .. }
             | Error::StatKeyFromUtf8 { .. }
             | Error::StatValueFromUtf8 { .. }
-            | Error::UnexpectedSequenceValue { .. }
+            | Error::InvalidRegionKeyFromUtf8 { .. }
             | Error::TableRouteNotFound { .. }
             | Error::TableInfoNotFound { .. }
             | Error::CorruptedTableRoute { .. }
-            | Error::NextSequence { .. }
-            | Error::SequenceOutOfRange { .. }
             | Error::MoveValue { .. }
             | Error::InvalidTxnResult { .. }
             | Error::InvalidUtf8Value { .. }
             | Error::UnexpectedInstructionReply { .. }
             | Error::Unexpected { .. }
             | Error::Txn { .. }
-            | Error::TableIdChanged { .. }
-            | Error::ConvertRawTableInfo { .. }
-            | Error::BuildTableMeta { .. } => StatusCode::Unexpected,
+            | Error::TableIdChanged { .. } => StatusCode::Unexpected,
             Error::TableNotFound { .. } => StatusCode::TableNotFound,
-            Error::Table { source, .. } => source.status_code(),
+            Error::InvalidateTableCache { source, .. } => source.status_code(),
             Error::RequestDatanode { source, .. } => source.status_code(),
-            Error::InvalidCatalogValue { source, .. } => source.status_code(),
+            Error::InvalidCatalogValue { source, .. }
+            | Error::InvalidFullTableName { source, .. } => source.status_code(),
             Error::RecoverProcedure { source, .. }
             | Error::SubmitProcedure { source, .. }
             | Error::WaitProcedure { source, .. } => source.status_code(),
@@ -606,15 +607,19 @@ impl ErrorExt for Error {
             }
 
             Error::RegionFailoverCandidatesNotFound { .. } => StatusCode::RuntimeResourcesExhausted,
+            Error::NextSequence { source, .. } => source.status_code(),
 
             Error::RegisterProcedureLoader { source, .. } => source.status_code(),
-
+            Error::OperateRegion { source, .. } => source.status_code(),
+            Error::SubmitDdlTask { source, .. } => source.status_code(),
             Error::TableRouteConversion { source, .. }
             | Error::ConvertProtoData { source, .. }
             | Error::TableMetadataManager { source, .. }
             | Error::UpdateTableRoute { source, .. }
             | Error::ConvertEtcdTxnObject { source, .. }
             | Error::GetFullTableInfo { source, .. } => source.status_code(),
+
+            Error::InitMetadata { source, .. } => source.status_code(),
 
             Error::Other { source, .. } => source.status_code(),
         }

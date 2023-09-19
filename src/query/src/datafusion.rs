@@ -486,7 +486,7 @@ mod tests {
     use std::borrow::Cow::Borrowed;
     use std::sync::Arc;
 
-    use catalog::{CatalogManager, RegisterTableRequest};
+    use catalog::RegisterTableRequest;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, NUMBERS_TABLE_ID};
     use common_query::Output;
     use common_recordbatch::{util, RecordBatch};
@@ -507,7 +507,7 @@ mod tests {
     use crate::query_engine::{QueryEngineFactory, QueryEngineRef};
 
     async fn create_test_engine() -> QueryEngineRef {
-        let catalog_manager = catalog::local::new_memory_catalog_manager().unwrap();
+        let catalog_manager = catalog::memory::new_memory_catalog_manager().unwrap();
         let req = RegisterTableRequest {
             catalog: DEFAULT_CATALOG_NAME.to_string(),
             schema: DEFAULT_SCHEMA_NAME.to_string(),
@@ -515,9 +515,9 @@ mod tests {
             table_id: NUMBERS_TABLE_ID,
             table: NumbersTable::table(NUMBERS_TABLE_ID),
         };
-        let _ = catalog_manager.register_table(req).await.unwrap();
+        catalog_manager.register_table_sync(req).unwrap();
 
-        QueryEngineFactory::new(catalog_manager, false).query_engine()
+        QueryEngineFactory::new(catalog_manager, None, false).query_engine()
     }
 
     #[tokio::test]

@@ -1,12 +1,10 @@
 # Node running mode, "standalone" or "distributed".
 mode = "standalone"
-# Whether to use in-memory catalog, `false` by default.
-enable_memory_catalog = false
 # Whether to enable greptimedb telemetry, true by default.
 enable_telemetry = true
 
 # HTTP server options.
-[http_options]
+[http]
 # Server address, "127.0.0.1:4000" by default.
 addr = "127.0.0.1:4000"
 # HTTP request timeout, 30s by default.
@@ -16,21 +14,23 @@ timeout = "30s"
 body_limit = "64MB"
 
 # gRPC server options.
-[grpc_options]
+[grpc]
 # Server address, "127.0.0.1:4001" by default.
 addr = "127.0.0.1:4001"
 # The number of server worker threads, 8 by default.
 runtime_size = 8
 
 # MySQL server options.
-[mysql_options]
+[mysql]
+# Whether to enable
+enable = true
 # Server address, "127.0.0.1:4002" by default.
 addr = "127.0.0.1:4002"
 # The number of server worker threads, 2 by default.
 runtime_size = 2
 
 # MySQL server TLS options.
-[mysql_options.tls]
+[mysql.tls]
 # TLS mode, refer to https://www.postgresql.org/docs/current/libpq-ssl.html
 # - "disable" (default value)
 # - "prefer"
@@ -44,14 +44,16 @@ cert_path = ""
 key_path = ""
 
 # PostgresSQL server options.
-[postgres_options]
+[postgres]
+# Whether to enable
+enable = true
 # Server address, "127.0.0.1:4003" by default.
 addr = "127.0.0.1:4003"
 # The number of server worker threads, 2 by default.
 runtime_size = 2
 
 # PostgresSQL server TLS options, see `[mysql_options.tls]` section.
-[postgres_options.tls]
+[postgres.tls]
 # TLS mode.
 mode = "disable"
 # certificate file path.
@@ -60,26 +62,26 @@ cert_path = ""
 key_path = ""
 
 # OpenTSDB protocol options.
-[opentsdb_options]
+[opentsdb]
+# Whether to enable
+enable = true
 # OpenTSDB telnet API server address, "127.0.0.1:4242" by default.
 addr = "127.0.0.1:4242"
 # The number of server worker threads, 2 by default.
 runtime_size = 2
 
 # InfluxDB protocol options.
-[influxdb_options]
+[influxdb]
 # Whether to enable InfluxDB protocol in HTTP API, true by default.
 enable = true
 
 # Prometheus remote storage options
-[prom_store_options]
+[prom_store]
 # Whether to enable Prometheus remote write and read in HTTP API, true by default.
 enable = true
 
 # WAL options.
 [wal]
-# WAL data directory
-# dir = "/tmp/greptimedb/wal"
 # WAL file size in bytes.
 file_size = "256MB"
 # WAL purge threshold.
@@ -90,6 +92,20 @@ purge_interval = "10m"
 read_batch_size = 128
 # Whether to sync log file after every write.
 sync_write = false
+
+# Kv options.
+[kv_store]
+# Kv file size in bytes.
+file_size = "256MB"
+# Kv purge threshold.
+purge_threshold = "4GB"
+
+# Procedure storage options.
+[procedure]
+# Procedure max retry time.
+max_retry_times = 3
+# Initial retry delay of procedures, increases exponentially
+retry_delay = "500ms"
 
 # Storage options.
 [storage]
@@ -129,13 +145,6 @@ picker_schedule_interval = "5m"
 auto_flush_interval = "1h"
 # Global write buffer size for all regions.
 global_write_buffer_size = "1GB"
-
-# Procedure storage options.
-[procedure]
-# Procedure max retry time.
-max_retry_times = 3
-# Initial retry delay of procedures, increases exponentially
-retry_delay = "500ms"
 
 # Log options
 # [logging]

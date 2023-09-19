@@ -19,7 +19,7 @@ use common_meta::rpc::router::{Table, TableRoute};
 use snafu::{OptionExt, ResultExt};
 use table::metadata::TableId;
 
-use crate::error::{self, Result, TableMetadataManagerSnafu};
+use crate::error::{self, Result, TableMetadataManagerSnafu, TableRouteNotFoundSnafu};
 use crate::metasrv::Context;
 
 pub(crate) async fn fetch_table(
@@ -32,9 +32,7 @@ pub(crate) async fn fetch_table(
         .context(TableMetadataManagerSnafu)?;
 
     if let Some(table_info) = table_info {
-        let table_route = table_route.with_context(|| error::TableRouteNotFoundSnafu {
-            table_name: table_info.table_ref().to_string(),
-        })?;
+        let table_route = table_route.context(TableRouteNotFoundSnafu { table_id })?;
 
         let table = Table {
             id: table_id as u64,
@@ -72,8 +70,6 @@ pub(crate) async fn fetch_tables(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::collections::{BTreeMap, HashMap};
-
     use chrono::DateTime;
     use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, MITO_ENGINE};
     use common_meta::key::TableMetadataManagerRef;
@@ -105,7 +101,6 @@ pub(crate) mod tests {
                 engine: MITO_ENGINE.to_string(),
                 next_column_id: 1,
                 region_numbers: vec![1, 2, 3, 4],
-                engine_options: HashMap::new(),
                 options: TableOptions::default(),
                 created_on: DateTime::default(),
                 partition_key_indices: vec![],
@@ -140,26 +135,5 @@ pub(crate) mod tests {
             .create_table_metadata(table_info, region_routes)
             .await
             .unwrap();
-    }
-
-    pub(crate) fn new_region_route(
-        region_number: u64,
-        peers: &[Peer],
-        leader_node: u64,
-    ) -> RegionRoute {
-        let region = Region {
-            id: region_number.into(),
-            name: "".to_string(),
-            partition: None,
-            attrs: BTreeMap::new(),
-        };
-
-        let leader_peer = peers.iter().find(|peer| peer.id == leader_node).cloned();
-
-        RegionRoute {
-            region,
-            leader_peer,
-            follower_peers: vec![],
-        }
     }
 }

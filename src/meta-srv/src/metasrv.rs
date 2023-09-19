@@ -16,11 +16,13 @@ pub mod builder;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::v1::meta::Peer;
-use common_catalog::consts::{DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME};
 use common_grpc::channel_manager;
+use common_meta::ddl::DdlTaskExecutorRef;
 use common_meta::key::TableMetadataManagerRef;
+use common_meta::sequence::SequenceRef;
 use common_procedure::options::ProcedureConfig;
 use common_procedure::ProcedureManagerRef;
 use common_telemetry::logging::LoggingOptions;
@@ -28,22 +30,20 @@ use common_telemetry::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use servers::http::HttpOptions;
 use snafu::ResultExt;
+use table::metadata::TableId;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::cluster::MetaPeerClientRef;
-use crate::ddl::DdlManagerRef;
 use crate::election::{Election, LeaderChangeMessage};
-use crate::error::{RecoverProcedureSnafu, Result};
+use crate::error::{InitMetadataSnafu, RecoverProcedureSnafu, Result};
 use crate::handler::HeartbeatHandlerGroup;
 use crate::lock::DistLockRef;
-use crate::metadata_service::MetadataServiceRef;
 use crate::pubsub::{PublishRef, SubscribeManagerRef};
 use crate::selector::{Selector, SelectorType};
-use crate::sequence::SequenceRef;
 use crate::service::mailbox::MailboxRef;
 use crate::service::store::kv::{KvStoreRef, ResettableKvStoreRef};
 pub const TABLE_ID_SEQ: &str = "table_id";
-const METASRV_HOME: &str = "/tmp/metasrv";
+pub const METASRV_HOME: &str = "/tmp/metasrv";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -51,11 +51,10 @@ pub struct MetaSrvOptions {
     pub bind_addr: String,
     pub server_addr: String,
     pub store_addr: String,
-    pub datanode_lease_secs: i64,
     pub selector: SelectorType,
     pub use_memory_store: bool,
-    pub disable_region_failover: bool,
-    pub http_opts: HttpOptions,
+    pub enable_region_failover: bool,
+    pub http: HttpOptions,
     pub logging: LoggingOptions,
     pub procedure: ProcedureConfig,
     pub datanode: DatanodeOptions,
@@ -69,16 +68,18 @@ impl Default for MetaSrvOptions {
             bind_addr: "127.0.0.1:3002".to_string(),
             server_addr: "127.0.0.1:3002".to_string(),
             store_addr: "127.0.0.1:2379".to_string(),
-            datanode_lease_secs: 15,
             selector: SelectorType::default(),
             use_memory_store: false,
-            disable_region_failover: false,
-            http_opts: HttpOptions::default(),
+            enable_region_failover: true,
+            http: HttpOptions::default(),
             logging: LoggingOptions {
                 dir: format!("{METASRV_HOME}/logs"),
                 ..Default::default()
             },
-            procedure: ProcedureConfig::default(),
+            procedure: ProcedureConfig {
+                max_retry_times: 12,
+                retry_delay: Duration::from_millis(500),
+            },
             datanode: DatanodeOptions::default(),
             enable_telemetry: true,
             data_home: METASRV_HOME.to_string(),
@@ -90,6 +91,10 @@ impl MetaSrvOptions {
     pub fn to_toml_string(&self) -> String {
         toml::to_string(&self).unwrap()
     }
+}
+
+pub struct MetasrvInfo {
+    pub server_addr: String,
 }
 
 // Options for datanode.
@@ -152,13 +157,11 @@ pub struct LeaderValue(pub String);
 
 #[derive(Clone)]
 pub struct SelectorContext {
-    pub datanode_lease_secs: i64,
     pub server_addr: String,
+    pub datanode_lease_secs: u64,
     pub kv_store: KvStoreRef,
     pub meta_peer_client: MetaPeerClientRef,
-    pub catalog: Option<String>,
-    pub schema: Option<String>,
-    pub table: Option<String>,
+    pub table_id: Option<TableId>,
 }
 
 pub type SelectorRef = Arc<dyn Selector<Context = SelectorContext, Output = Vec<Peer>>>;
@@ -180,9 +183,8 @@ pub struct MetaSrv {
     election: Option<ElectionRef>,
     lock: DistLockRef,
     procedure_manager: ProcedureManagerRef,
-    metadata_service: MetadataServiceRef,
     mailbox: MailboxRef,
-    ddl_manager: DdlManagerRef,
+    ddl_executor: DdlTaskExecutorRef,
     table_metadata_manager: TableMetadataManagerRef,
     pubsub: Option<(PublishRef, SubscribeManagerRef)>,
 }
@@ -268,9 +270,10 @@ impl MetaSrv {
     }
 
     async fn create_default_schema_if_not_exist(&self) -> Result<()> {
-        self.metadata_service
-            .create_schema(DEFAULT_CATALOG_NAME, DEFAULT_SCHEMA_NAME, true)
+        self.table_metadata_manager
+            .init()
             .await
+            .context(InitMetadataSnafu)
     }
 
     pub fn shutdown(&self) {
@@ -322,8 +325,8 @@ impl MetaSrv {
         &self.mailbox
     }
 
-    pub fn ddl_manager(&self) -> &DdlManagerRef {
-        &self.ddl_manager
+    pub fn ddl_executor(&self) -> &DdlTaskExecutorRef {
+        &self.ddl_executor
     }
 
     pub fn procedure_manager(&self) -> &ProcedureManagerRef {
@@ -352,6 +355,7 @@ impl MetaSrv {
         let mailbox = self.mailbox.clone();
         let election = self.election.clone();
         let skip_all = Arc::new(AtomicBool::new(false));
+        let table_metadata_manager = self.table_metadata_manager.clone();
 
         Context {
             server_addr,
@@ -363,7 +367,7 @@ impl MetaSrv {
             election,
             skip_all,
             is_infancy: false,
-            table_metadata_manager: self.table_metadata_manager.clone(),
+            table_metadata_manager,
         }
     }
 }
